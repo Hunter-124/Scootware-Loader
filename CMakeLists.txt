@@ -29,6 +29,7 @@ set(IMGUI_SOURCES
 
 add_executable(ScootwareLoader WIN32
     src/main.cpp
+    src/hwid.cpp
     src/api/api.cpp
     src/api/session.cpp
     src/memory/runpe.cpp
@@ -43,7 +44,20 @@ target_link_options(ScootwareLoader PRIVATE
     "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
 )
 
-target_link_libraries(ScootwareLoader d3d11 d3dcompiler user32 crypt32 shell32)
+target_link_libraries(ScootwareLoader d3d11 d3dcompiler dxgi user32 crypt32 shell32)
+
+# Minimal hollow host — console subsystem so GetStdHandle works for any payload.
+# Named scootware.exe because that is what the kernel driver searches for.
+add_executable(ScootwareHost
+    src/host/host.cpp
+)
+set_target_properties(ScootwareHost PROPERTIES
+    OUTPUT_NAME "scootware"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+)
+target_link_options(ScootwareHost PRIVATE
+    "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+)
 
 add_executable(HelloWorldTest
     ${CMAKE_SOURCE_DIR}/../test_exe/test_helloworld.cpp

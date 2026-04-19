@@ -1,13 +1,22 @@
 #include "api.h"
 #include <windows.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <iomanip>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace Api {
+
+    // Set when StreamAsset receives HTTP 403 (HWID mismatch).
+    static bool s_lastStreamHwidMismatch = false;
+
+    bool LastStreamWasHwidMismatch() { return s_lastStreamHwidMismatch; }
 
     // Simple helper to perform a WinHttp request
     struct HttpResponse {
@@ -52,7 +61,7 @@ namespace Api {
         return output;
     }
 
-    HttpResponse PerformRequest(const std::string& method, const std::string& path, const std::string& postData = "", const std::string& token = "") {
+    HttpResponse PerformRequest(const std::string& method, const std::string& path, const std::string& postData = "", const std::string& token = "", const std::string& hwid = "") {
         HttpResponse response = { false, "", 0, 0 };
         ApiSettings settings = GetSettings();
         
@@ -75,6 +84,10 @@ namespace Api {
             if (!token.empty()) {
                 std::wstring wToken(token.begin(), token.end());
                 headers += L"Authorization: Bearer " + wToken + L"\r\n";
+            }
+            if (!hwid.empty()) {
+                std::wstring wHwid(hwid.begin(), hwid.end());
+                headers += L"X-HWID: " + wHwid + L"\r\n";
             }
 
             BOOL bResults = WinHttpSendRequest(hRequest, headers.c_str(), -1, (LPVOID)postData.c_str(), (DWORD)postData.length(), (DWORD)postData.length(), 0);
@@ -231,19 +244,205 @@ namespace Api {
         return res;
     }
 
-    std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token) {
-        std::cout << "[API] Fetching stream for " << productId << " (" << assetType << ")...\n";
-        
-        // Hypothetical route: /api/products/:productId/assets/primary/stream
-        std::string path = "/api/products/" + productId + "/assets/stream?type=" + assetType;
-        HttpResponse resp = PerformRequest("GET", path, "", token);
-        
-        if (resp.success && !resp.body.empty()) {
-            std::vector<uint8_t> buffer(resp.body.begin(), resp.body.end());
-            std::cout << "[API] Downloaded " << buffer.size() << " bytes.\n";
-            return { buffer, resp.allocationSizeHeader };
+    // -----------------------------------------------------------------------
+    // Asset encryption helpers
+    // -----------------------------------------------------------------------
+
+    // XOR-obfuscated AES-256 asset encryption secret (32 bytes).
+    // The server uses this same secret (set as ASSET_ENCRYPTION_SECRET env var)
+    // to derive the AES-256-GCM key: HMAC-SHA256(secret, hwid).
+    // Plaintext: "Sc00tAES-Pr0tect-K3y-4-Ass3ts-!!"
+    // To rotate: XOR your new 32-byte secret against a new mask, update both arrays,
+    // and set the matching hex value in ASSET_ENCRYPTION_SECRET on the server.
+    static std::vector<uint8_t> GetAesSecret() {
+        static const uint8_t xored[32] = {
+            0x90,0x19,0xA1,0x7E,0xC9,0x13,0xED,0x64,
+            0xDB,0x4D,0xF1,0xFA,0x22,0x87,0xFC,0x3F,
+            0xF5,0x29,0x24,0xD5,0x72,0xDF,0x0E,0xC5,
+            0x32,0x84,0xAF,0x4A,0xF9,0x98,0x4C,0xE1
+        };
+        static const uint8_t mask[32] = {
+            0xC3,0x7A,0x91,0x4E,0xBD,0x52,0xA8,0x37,
+            0xF6,0x1D,0x83,0xCA,0x56,0xE2,0x9F,0x4B,
+            0xD8,0x62,0x17,0xAC,0x5F,0xEB,0x23,0x84,
+            0x41,0xF7,0x9C,0x3E,0x8A,0xB5,0x6D,0xC0
+        };
+        std::vector<uint8_t> key(32);
+        for (int i = 0; i < 32; i++) key[i] = xored[i] ^ mask[i];
+        return key;
+    }
+
+    // HMAC-SHA256 returning raw bytes (for AES key derivation).
+    static std::vector<uint8_t> HmacSha256Raw(const uint8_t* key, size_t keyLen, const std::string& data) {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        DWORD cbHash = 0, cbHashObj = 0, cbData = 0;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return {};
+        if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbHashObj, sizeof(DWORD), &cbData, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
         }
-        
-        return { {}, 0 };
+        if (BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&cbHash, sizeof(DWORD), &cbData, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        std::vector<BYTE> hashObj(cbHashObj), hash(cbHash);
+        if (BCryptCreateHash(hAlg, &hHash, hashObj.data(), cbHashObj, (PUCHAR)key, (ULONG)keyLen, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        if (BCryptHashData(hHash, (PUCHAR)data.c_str(), (ULONG)data.size(), 0) != 0) {
+            BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        if (BCryptFinishHash(hHash, hash.data(), cbHash, 0) != 0) {
+            BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return std::vector<uint8_t>(hash.begin(), hash.end());
+    }
+
+    // AES-256-GCM decryption via Windows CNG.
+    // Input layout: [ 12-byte IV | ciphertext | 16-byte auth tag ]
+    static std::vector<uint8_t> AesGcmDecrypt(
+        const std::vector<uint8_t>& key32,
+        const uint8_t* iv,
+        const uint8_t* ciphertext, size_t cipherLen,
+        const uint8_t* tag)
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        DWORD cbKeyObj = 0, cbData = 0;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
+            return {};
+
+        // Switch to GCM mode
+        if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+            (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObj, sizeof(DWORD), &cbData, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+
+        std::vector<BYTE> keyObj(cbKeyObj);
+        if (BCryptGenerateSymmetricKey(hAlg, &hKey, keyObj.data(), cbKeyObj,
+            (PUCHAR)key32.data(), 32, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+
+        // Auth tag buffer — BCryptDecrypt needs a mutable copy
+        std::vector<uint8_t> tagCopy(tag, tag + 16);
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+        BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+        authInfo.pbNonce   = (PUCHAR)iv;
+        authInfo.cbNonce   = 12;
+        authInfo.pbTag     = tagCopy.data();
+        authInfo.cbTag     = 16;
+
+        std::vector<uint8_t> plaintext(cipherLen);
+        ULONG cbPlaintext = 0;
+
+        NTSTATUS status = BCryptDecrypt(
+            hKey, (PUCHAR)ciphertext, (ULONG)cipherLen,
+            &authInfo, nullptr, 0,
+            plaintext.data(), (ULONG)cipherLen, &cbPlaintext, 0);
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) {
+            std::cout << "[API] AES-GCM decryption failed (status 0x" << std::hex << status << std::dec << "). HWID mismatch or tampered data.\n";
+            return {};
+        }
+        plaintext.resize(cbPlaintext);
+        return plaintext;
+    }
+
+    // -----------------------------------------------------------------------
+
+    std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token, const std::string& hwid) {
+        std::cout << "[API] Fetching encrypted stream for " << productId << " (" << assetType << ")...\n";
+        s_lastStreamHwidMismatch = false;
+
+        std::string path = "/api/products/" + productId + "/assets/stream?type=" + assetType;
+        // Pass hwid so PerformRequest adds the X-HWID header
+        HttpResponse resp = PerformRequest("GET", path, "", token, hwid);
+
+        // Minimum valid encrypted payload: 12 (IV) + 1 (ciphertext) + 16 (tag)
+        const size_t MIN_ENCRYPTED_LEN = 29;
+
+        if (!resp.success) {
+            if (resp.statusCode == 403) {
+                s_lastStreamHwidMismatch = true;
+                std::cout << "[API] HWID mismatch — this account is bound to a different machine.\n";
+            } else {
+                std::cout << "[API] Stream request failed (status " << resp.statusCode << ").\n";
+            }
+            return { {}, 0 };
+        }
+
+        if (resp.body.size() < MIN_ENCRYPTED_LEN) {
+            std::cout << "[API] Stream response too small to be valid encrypted data.\n";
+            return { {}, 0 };
+        }
+
+        const uint8_t* raw      = reinterpret_cast<const uint8_t*>(resp.body.data());
+        size_t          totalLen = resp.body.size();
+        const uint8_t* iv        = raw;
+        size_t          cipherLen = totalLen - 12 - 16;
+        const uint8_t* ciphertext = raw + 12;
+        const uint8_t* tag        = raw + 12 + cipherLen;
+
+        // Derive AES-256 key = HMAC-SHA256(embedded_secret, hwid)
+        std::vector<uint8_t> secret = GetAesSecret();
+        std::vector<uint8_t> aesKey = HmacSha256Raw(secret.data(), secret.size(), hwid);
+        SecureZeroMemory(secret.data(), secret.size());
+
+        if (aesKey.empty()) {
+            std::cout << "[API] Failed to derive AES key.\n";
+            return { {}, 0 };
+        }
+
+        std::vector<uint8_t> plaintext = AesGcmDecrypt(aesKey, iv, ciphertext, cipherLen, tag);
+        SecureZeroMemory(aesKey.data(), aesKey.size());
+
+        if (plaintext.empty())
+            return { {}, 0 };
+
+        std::cout << "[API] Decrypted " << plaintext.size() << " bytes successfully.\n";
+        return { plaintext, resp.allocationSizeHeader };
+    }
+
+    HwidResetResponse SubmitHwidResetRequest(const std::string& token, const std::string& newHwid, const Hwid::HardwareDetails& newDetails) {
+        HwidResetResponse res = { false, "" };
+
+        // Build a minimal JSON payload with the new machine's HWID + human-readable details
+        std::string cpu = JsonEscape(newDetails.cpu);
+        std::string gpu = JsonEscape(newDetails.gpu);
+        std::string ram = std::to_string(newDetails.ramGb);
+        std::string hwid = JsonEscape(newHwid);
+
+        std::string payload =
+            "{\"newHwid\":\"" + hwid + "\","
+            "\"newHwidDetails\":{\"cpu\":\"" + cpu + "\",\"gpu\":\"" + gpu + "\",\"ramGb\":" + ram + "}}";
+
+        HttpResponse resp = PerformRequest("POST", "/api/hwid-reset", payload, token);
+
+        if (resp.success) {
+            res.success = true;
+            res.message = "Reset request submitted. An admin will review it shortly.";
+        } else if (resp.statusCode == 409) {
+            res.success = false;
+            res.message = "You already have a pending HWID reset request.";
+        } else if (resp.statusCode == 401) {
+            res.success = false;
+            res.message = "Session expired. Please log in again.";
+        } else {
+            res.success = false;
+            res.message = "Failed to submit reset request (Err: " + std::to_string(resp.statusCode) + ")";
+        }
+        return res;
     }
 }

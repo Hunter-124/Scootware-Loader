@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <thread>
+#include <atomic>
 
 // ImGui headers (Assume these are included in the project)
 #include "imgui.h"
@@ -13,6 +15,7 @@
 // Backend interfaces
 #include "api/api.h"
 #include "api/session.h"
+#include "hwid.h"
 #include "memory/runpe.h"
 
 // Data
@@ -40,6 +43,15 @@ std::string g_statusMessage = "";
 char g_username[64] = "";
 char g_password[64] = "";
 bool g_rememberMe = false;
+std::string g_hwid = "";
+
+// Injection runs on a background thread so the UI stays responsive.
+static std::atomic<bool> g_injecting{ false };
+
+// HWID mismatch state
+bool g_hwidMismatch = false;
+bool g_hwidResetSubmitted = false;
+std::string g_hwidResetMessage = "";
 
 // Theme setup - Scootware Purple
 void SetupImGuiStyle() {
@@ -152,20 +164,58 @@ void DrawProductScreen() {
         if (ImGui::Button(prod.productId.c_str(), ImVec2(150, 50))) {
             if (prod.hasAccess) {
                 g_state = AppState::Injecting;
+                g_hwidMismatch = false;
+                g_hwidResetSubmitted = false;
+                g_hwidResetMessage = "";
                 g_statusMessage = "Streaming payload for " + prod.productId + "...";
-                
-                // --- In a real app this would execute asynchronously ---
-                // Grabbing payload binary AND required dynamic allocation buffer size directly from backend 
-                auto[exeBuffer, allocSize] = Api::StreamAsset(prod.productId, "primary_exe", g_authInfo.token);
-                if (!exeBuffer.empty()) {
-                    // Start randomized execute instead of SVCHOST directly
-                    if (RunPE::Execute(exeBuffer, allocSize)) {
-                         g_statusMessage = "Injected successfully! You can close this loader.";
-                    } else {
-                         g_statusMessage = "Injection failed (RunPE Error).";
-                    }
-                } else {
-                    g_statusMessage = "Failed to stream asset from secure server.";
+
+                if (!g_injecting.exchange(true)) {
+                    std::string productId = prod.productId;
+                    std::string token     = g_authInfo.token;
+                    std::string hwid      = g_hwid;
+                    std::thread([productId, token, hwid]() {
+                        // Attempt to fetch hollow executable first
+                        auto [hollowBuffer, hollowAllocSize] = Api::StreamAsset(productId, "hollow_exe", token, hwid);
+                        std::string customHostPath = "";
+                        
+                        if (!hollowBuffer.empty()) {
+                            char tempPath[MAX_PATH];
+                            if (GetTempPathA(MAX_PATH, tempPath)) {
+                                char tempFile[MAX_PATH];
+                                if (GetTempFileNameA(tempPath, "sct", 0, tempFile)) {
+                                    // Change extension to .exe
+                                    customHostPath = std::string(tempFile) + ".exe";
+                                    DeleteFileA(tempFile); // Remove the .tmp file created by GetTempFileName
+                                    
+                                    FILE* f = nullptr;
+                                    fopen_s(&f, customHostPath.c_str(), "wb");
+                                    if (f) {
+                                        fwrite(hollowBuffer.data(), 1, hollowBuffer.size(), f);
+                                        fclose(f);
+                                    } else {
+                                        customHostPath = ""; // Fallback if write fails
+                                    }
+                                }
+                            }
+                        }
+
+                        auto [exeBuffer, allocSize] = Api::StreamAsset(productId, "primary_exe", token, hwid);
+                        if (!exeBuffer.empty()) {
+                            if (RunPE::Execute(exeBuffer, allocSize, customHostPath)) {
+                                g_statusMessage = "Injected successfully! You can close this loader.";
+                            } else {
+                                g_statusMessage = "Injection failed (RunPE Error).";
+                            }
+                        } else {
+                            g_hwidMismatch = Api::LastStreamWasHwidMismatch();
+                            if (g_hwidMismatch) {
+                                g_statusMessage = "HWID mismatch — this account is bound to a different machine.";
+                            } else {
+                                g_statusMessage = "Failed to stream asset from secure server.";
+                            }
+                        }
+                        g_injecting = false;
+                    }).detach();
                 }
             }
         }
@@ -210,8 +260,48 @@ void DrawInjectingScreen() {
     ImGui::TextWrapped("%s", g_statusMessage.c_str());
     
     ImGui::Spacing();
+
+    // ── HWID mismatch: offer a reset request ──────────────────────────────
+    if (g_hwidMismatch) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.1f, 1.0f),
+            "Your account is bound to a different machine.");
+        ImGui::TextWrapped(
+            "If you changed hardware or are on a new PC, you can request a\n"
+            "HWID reset. An admin will review and approve or deny it.");
+
+        ImGui::Spacing();
+
+        if (g_hwidResetSubmitted) {
+            if (g_hwidResetMessage.empty()) {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Submitting...");
+            } else {
+                ImGui::TextWrapped("%s", g_hwidResetMessage.c_str());
+            }
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.70f, 0.40f, 0.05f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.50f, 0.10f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.55f, 0.30f, 0.03f, 1.00f));
+
+            if (ImGui::Button("Request HWID Reset", ImVec2(ImGui::GetContentRegionAvail().x, 36))) {
+                g_hwidResetSubmitted = true;
+                Hwid::HardwareDetails details = Hwid::GetHardwareDetails();
+                Api::HwidResetResponse r = Api::SubmitHwidResetRequest(g_authInfo.token, g_hwid, details);
+                g_hwidResetMessage = r.message;
+            }
+
+            ImGui::PopStyleColor(3);
+        }
+
+        ImGui::Spacing();
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     if (ImGui::Button("Return to Products", ImVec2(ImGui::GetContentRegionAvail().x, 40))) {
         g_state = AppState::Products;
+        g_hwidMismatch = false;
+        g_hwidResetSubmitted = false;
+        g_hwidResetMessage = "";
     }
 }
 
@@ -228,16 +318,23 @@ void SetupConsole() {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // If spawned as a child host for injection, enter a benign idle state
-    if (pCmdLine && wcsstr(pCmdLine, L"--child")) {
-        // We just need a stable process that doesn't exit immediately.
-        // The parent will hollow us.
-        while (true) Sleep(10000);
-        return 0;
-    }
+    // [DEAD CODE] --child self-hollowing removed; scootware.exe is now the dedicated host.
+    // if (pCmdLine && wcsstr(pCmdLine, L"--child")) {
+    //     while (true) Sleep(10000);
+    //     return 0;
+    // }
 
     // Initialize debug console
     SetupConsole();
+
+    // Generate hardware fingerprint used for HWID binding
+    g_hwid = Hwid::GetHWID();
+    if (g_hwid.empty()) {
+        std::cout << "[HWID] Warning: Failed to generate HWID, using fallback.\n";
+        g_hwid = "UNKNOWN";
+    } else {
+        std::cout << "[HWID] " << g_hwid << "\n";
+    }
 
     // Register window class
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ScootwareLoader", nullptr };

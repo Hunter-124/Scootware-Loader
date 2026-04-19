@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include "../hwid.h"
 
 namespace Api {
     struct ProductAccess {
@@ -17,10 +18,27 @@ namespace Api {
         std::vector<ProductAccess> subscriptions;
     };
 
-    // Authenticate and return user subscriptions
+    struct HwidResetResponse {
+        bool success;
+        std::string message;
+    };
+
+    // Authenticate and return user subscriptions.
     AuthResponse Login(const std::string& username, const std::string& password);
 
-    // Stream a specific asset from the backend into a byte buffer
-    // Returns pair<PayloadBuffer, ExpectedAllocationSize>
-    std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token);
+    // Stream a specific asset from the backend into a decrypted byte buffer.
+    // hwid must be the value from Hwid::GetHWID() — sent as X-HWID header and
+    // used to derive the AES-256-GCM decryption key for the encrypted response.
+    // Returns pair<PlaintextBuffer, ExpectedAllocationSize>
+    std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token, const std::string& hwid);
+
+    // Submit a HWID reset request after a 403 HWID mismatch on StreamAsset.
+    // newHwid    — the HWID of this machine (the one that was rejected)
+    // newDetails — human-readable hardware of this machine
+    // token      — the session token from login
+    HwidResetResponse SubmitHwidResetRequest(const std::string& token, const std::string& newHwid, const Hwid::HardwareDetails& newDetails);
+
+    // Returns true if the last StreamAsset call failed with a HWID mismatch (HTTP 403).
+    bool LastStreamWasHwidMismatch();
 }
+
