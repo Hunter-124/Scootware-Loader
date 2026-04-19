@@ -308,14 +308,7 @@ void DrawInjectingScreen() {
 // Forward declare ImGui_ImplWin32_WndProcHandler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-void SetupConsole() {
-    AllocConsole();
-    FILE* fDummy;
-    freopen_s(&fDummy, "CONOUT$", "w", stdout);
-    freopen_s(&fDummy, "CONOUT$", "w", stderr);
-    freopen_s(&fDummy, "CONIN$", "r", stdin);
-    std::cout << "[*] System: Debug console initialized.\n";
-}
+
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     // [DEAD CODE] --child self-hollowing removed; scootware.exe is now the dedicated host.
@@ -323,9 +316,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     //     while (true) Sleep(10000);
     //     return 0;
     // }
-
-    // Initialize debug console
-    SetupConsole();
 
     // Generate hardware fingerprint used for HWID binding
     g_hwid = Hwid::GetHWID();
