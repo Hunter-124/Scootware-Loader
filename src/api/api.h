@@ -15,6 +15,7 @@ namespace Api {
         bool success;
         std::string token;
         std::string message;
+        std::string avatarUrl;
         std::vector<ProductAccess> subscriptions;
     };
 

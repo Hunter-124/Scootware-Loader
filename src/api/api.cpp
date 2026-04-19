@@ -199,6 +199,7 @@ namespace Api {
                 res.success = true;
                 res.token = GetJsonValue(resp.body, "token");
                 res.message = "Login successful!";
+                res.avatarUrl = GetJsonValue(resp.body, "avatarUrl");
                 
                 // Parse activeProducts
                 std::string productsArray = GetJsonArray(resp.body, "activeProducts");
