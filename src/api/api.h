@@ -40,5 +40,13 @@ namespace Api {
 
     // Returns true if the last StreamAsset call failed with a HWID mismatch (HTTP 403).
     bool LastStreamWasHwidMismatch();
-}
 
+    // Report VM / debugger detection to the backend so it shows in the admin logs.
+    // vmDetected      — true if any VM-environment check triggered
+    // debuggerDetected — true if any anti-debug check triggered
+    // hwid            — machine hardware fingerprint (may be empty if not yet generated)
+    // triggers        — list of specific detection vector labels (e.g. "VM process running: vmtoolsd.exe")
+    void ReportDetection(bool vmDetected, bool debuggerDetected,
+                         const std::string& hwid,
+                         const std::vector<std::string>& triggers);
+}

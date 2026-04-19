@@ -445,4 +445,35 @@ namespace Api {
         }
         return res;
     }
+
+    void ReportDetection(bool vmDetected, bool debuggerDetected,
+                         const std::string& hwid,
+                         const std::vector<std::string>& triggers)
+    {
+        // Build a semicolon-separated details string from all triggered vectors
+        std::string details;
+        for (size_t i = 0; i < triggers.size(); ++i) {
+            if (i) details += "; ";
+            details += triggers[i];
+        }
+
+        std::string safeHwid    = JsonEscape(hwid.empty() ? "UNKNOWN" : hwid);
+        std::string safeDetails = JsonEscape(details.empty() ? "unknown" : details);
+
+        std::string eventType = "detection";
+        if (vmDetected && debuggerDetected) eventType = "vm_and_debugger_detected";
+        else if (vmDetected)               eventType = "vm_detected";
+        else if (debuggerDetected)         eventType = "debugger_detected";
+
+        std::string payload =
+            "{\"hwid\":\"" + safeHwid + "\","
+            "\"vmDetected\":" + (vmDetected ? "true" : "false") + ","
+            "\"debuggerDetected\":" + (debuggerDetected ? "true" : "false") + ","
+            "\"eventType\":\"" + eventType + "\","
+            "\"details\":\"" + safeDetails + "\"}";
+
+        // Best-effort: fire and forget. No token needed — unauthenticated endpoint
+        // exists specifically for pre-login loader reporting.
+        PerformRequest("POST", "/api/auth/loader-event", payload);
+    }
 }

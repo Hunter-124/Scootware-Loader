@@ -33,6 +33,7 @@ add_executable(ScootwareLoader WIN32
     src/api/api.cpp
     src/api/session.cpp
     src/memory/runpe.cpp
+    src/vmdetect.cpp
     ${IMGUI_SOURCES}
 )
 

@@ -17,6 +17,7 @@
 #include "api/session.h"
 #include "hwid.h"
 #include "memory/runpe.h"
+#include "vmdetect.h"
 
 // Data
 static ID3D11Device*            g_pd3dDevice = nullptr;
@@ -316,6 +317,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     //     while (true) Sleep(10000);
     //     return 0;
     // }
+
+    // ── VM / Sandbox detection ───────────────────────────────────────────
+    {
+        auto vmResult = VMDetect::Check();
+        if (vmResult.isVM) {
+            // Report to backend before exiting so admins see the detection in logs.
+            // HWID may not be generated yet — pass empty string; the backend will
+            // attempt a lookup by IP if available.
+            Api::ReportDetection(
+                vmResult.isVMEnv,
+                vmResult.isDebugger,
+                /*hwid=*/ "",
+                vmResult.triggers
+            );
+            // Silent exit — don't reveal detection reason to analyst
+            return 0;
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     // Generate hardware fingerprint used for HWID binding
     g_hwid = Hwid::GetHWID();
