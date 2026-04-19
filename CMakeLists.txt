@@ -30,8 +30,25 @@ set(IMGUI_SOURCES
 add_executable(ScootwareLoader WIN32
     src/main.cpp
     src/api/api.cpp
+    src/api/session.cpp
     src/memory/runpe.cpp
     ${IMGUI_SOURCES}
 )
 
-target_link_libraries(ScootwareLoader d3d11 d3dcompiler user32)
+# Require administrator privileges (UAC elevation prompt)
+set_target_properties(ScootwareLoader PROPERTIES
+    VS_USER_PROPS ""
+)
+target_link_options(ScootwareLoader PRIVATE
+    "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+)
+
+target_link_libraries(ScootwareLoader d3d11 d3dcompiler user32 crypt32 shell32)
+
+add_executable(HelloWorldTest
+    ${CMAKE_SOURCE_DIR}/../test_exe/test_helloworld.cpp
+)
+set_target_properties(HelloWorldTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../test_exe"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/../test_exe"
+)

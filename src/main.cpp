@@ -12,6 +12,7 @@
 
 // Backend interfaces
 #include "api/api.h"
+#include "api/session.h"
 #include "memory/runpe.h"
 
 // Data
@@ -38,6 +39,7 @@ Api::AuthResponse g_authInfo;
 std::string g_statusMessage = "";
 char g_username[64] = "";
 char g_password[64] = "";
+bool g_rememberMe = false;
 
 // Theme setup - Scootware Purple
 void SetupImGuiStyle() {
@@ -88,6 +90,9 @@ void DrawLoginScreen() {
     ImGui::InputText("Password", g_password, IM_ARRAYSIZE(g_password), ImGuiInputTextFlags_Password);
 
     ImGui::Spacing();
+    ImGui::Checkbox("Remember Me", &g_rememberMe);
+
+    ImGui::Spacing();
     
     if (ImGui::Button("Login", ImVec2(ImGui::GetContentRegionAvail().x, 40))) {
         // Trim inputs
@@ -106,6 +111,9 @@ void DrawLoginScreen() {
         g_authInfo = Api::Login(userStr, passStr);
         
         if (g_authInfo.success) {
+            if (g_rememberMe) {
+                Session::SaveCredentials(userStr, passStr);
+            }
             g_state = AppState::Products;
             g_statusMessage = "";
         } else {
@@ -186,9 +194,11 @@ void DrawProductScreen() {
     
     ImGui::Separator();
     if (ImGui::Button("Logout", ImVec2(100, 30))) {
+        Session::ClearCredentials();
         g_state = AppState::Login;
         g_statusMessage = "Logged out.";
         g_password[0] = '\0';
+        g_rememberMe = false;
     }
 }
 
@@ -255,6 +265,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Auto-login if session exists
+    Session::Credentials creds;
+    if (Session::LoadCredentials(creds)) {
+        g_statusMessage = "Auto-logging in...";
+        g_authInfo = Api::Login(creds.username, creds.password);
+        if (g_authInfo.success) {
+            g_state = AppState::Products;
+            g_statusMessage = "";
+            g_rememberMe = true;
+            strcpy_s(g_username, creds.username.c_str());
+            // We don't necessarily need to fill g_password here as it's not used once logged in
+        } else {
+            g_statusMessage = "Session expired. Please login again.";
+            Session::ClearCredentials();
+        }
+    }
 
     // Main loop
     bool done = false;

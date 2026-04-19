@@ -1,11 +1,8 @@
 #pragma once
 #include <vector>
-#include <string>
+#include <cstdint>
 
 namespace RunPE {
-    // Hollows out hostProcessPath and executes memoryBuffer inside
+    // Process hollowing: maps PE from memoryBuffer into a suspended child process
     bool Execute(const std::vector<uint8_t>& memoryBuffer, size_t allocationSize);
-
-    // Private helper: Randomly duplicates a legitimate host into %temp%
-    std::string GenerateRandomizedHost();
 }
