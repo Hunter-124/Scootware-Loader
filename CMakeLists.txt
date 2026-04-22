@@ -4,8 +4,44 @@ project(ScootwareLoader)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# In a real scenario, adding CPR, libcurl, and JSON is necessary.
-# For stub purposes we just use basic libraries.
+# ─────────────────────────────────────────────────────────────────────────────
+# Release-build hardening for MSVC
+#
+# These flags meaningfully raise the bar for static analysis (IDA / Ghidra /
+# Binary Ninja) by stripping debug info, inlining aggressively, and folding
+# functions/data so symbols become harder to recover. Combined with the
+# compile-time string encryption in src/security/obf.h, the resulting binary
+# exposes very little to a casual reverse engineer.
+#
+# Notes:
+#   * Only applied for the Release configuration. Debug builds remain
+#     unobfuscated and easy to step through.
+#   * `/GL` (whole-program optimization) requires `/LTCG` at link time.
+#   * `/Oi` enables intrinsic expansion (CRT calls disappear into the body).
+#   * `/Gy` + `/OPT:REF /OPT:ICF` lets the linker drop unused functions and
+#     fold identical functions/data, hiding the original code structure.
+# ─────────────────────────────────────────────────────────────────────────────
+if(MSVC)
+    add_compile_options(
+        $<$<CONFIG:Release>:/O2>      # max speed
+        $<$<CONFIG:Release>:/Ob2>     # aggressive inlining
+        $<$<CONFIG:Release>:/Oi>      # intrinsic functions
+        $<$<CONFIG:Release>:/Os>      # favor size where speed-equivalent
+        $<$<CONFIG:Release>:/GL>      # whole-program optimization
+        $<$<CONFIG:Release>:/Gy>      # function-level linking (enables ICF)
+        $<$<CONFIG:Release>:/GS->     # disable buffer security cookies (smaller, harder to fingerprint)
+        $<$<CONFIG:Release>:/Zc:inline>
+        $<$<CONFIG:Release>:/MT>      # statically link CRT — no external CRT footprint
+    )
+    add_link_options(
+        $<$<CONFIG:Release>:/LTCG>           # required for /GL
+        $<$<CONFIG:Release>:/OPT:REF>        # strip unreferenced funcs/data
+        $<$<CONFIG:Release>:/OPT:ICF=3>      # fold identical funcs AND read-only data
+        $<$<CONFIG:Release>:/DEBUG:NONE>     # no PDB, no debug directory entries
+    )
+    # Ensure the static CRT (/MT) is honored across configs.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 # ImGui Library Path
 set(IMGUI_DIR "imgui-master/imgui-master")
@@ -35,8 +71,14 @@ add_executable(ScootwareLoader WIN32
     src/memory/runpe.cpp
     src/vmdetect.cpp
     src/image_loader.cpp
+    src/security/handoff.cpp
+    src/security/driver_bringup.cpp
+    src/util/process_wait.cpp
     ${IMGUI_SOURCES}
 )
+
+# Make the project root visible so source files can `#include "security/obf.h"`
+target_include_directories(ScootwareLoader PRIVATE src)
 
 # Require administrator privileges (UAC elevation prompt)
 set_target_properties(ScootwareLoader PROPERTIES

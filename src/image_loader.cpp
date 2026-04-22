@@ -1,4 +1,5 @@
 #include "image_loader.h"
+#include "security/obf.h"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -63,7 +64,7 @@ namespace ImageLoader {
                          std::wstring& path, bool& secure)
     {
         // Defaults: relative to scootware.us
-        host   = L"scootware.us";
+        host   = OBF_W(L"scootware.us");
         port   = 443;
         secure = true;
 
@@ -97,7 +98,7 @@ namespace ImageLoader {
         bool           secure;
         if (!ParseUrl(url, host, port, path, secure)) return false;
 
-        HINTERNET hSession = WinHttpOpen(L"ScootwareLoader/1.0",
+        HINTERNET hSession = WinHttpOpen(OBF_C(L"ScootwareLoader/1.0"),
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME,
                                          WINHTTP_NO_PROXY_BYPASS, 0);
@@ -106,7 +107,7 @@ namespace ImageLoader {
         HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
         if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
 
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, OBF_C(L"GET"), path.c_str(),
                                                 NULL, WINHTTP_NO_REFERER,
                                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
                                                 secure ? WINHTTP_FLAG_SECURE : 0);

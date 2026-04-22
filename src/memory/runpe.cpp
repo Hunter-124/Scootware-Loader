@@ -1,4 +1,6 @@
 #include "runpe.h"
+#include "../security/obf.h"
+#include "../util/diaglog.h"
 #include <iostream>
 #include <shlobj.h>
 #include <windows.h>
@@ -146,7 +148,7 @@ static bool ApplyRelocations(HANDLE hProcess, LPVOID pRemoteImage,
 // ready.
 static void EnsureDllInChild(HANDLE hProcess, const char *dllName) {
   FARPROC pLoadLibraryA =
-      GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+      GetProcAddress(GetModuleHandleA(OBF_A("kernel32.dll")), OBF_A("LoadLibraryA"));
   SIZE_T nameLen = strlen(dllName) + 1;
   LPVOID pRemote = VirtualAllocEx(hProcess, NULL, nameLen,
                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -267,11 +269,38 @@ static bool ResolveImports(HANDLE hProcess, LPVOID pRemoteImage,
 }
 
 bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
-             const std::string &customHostPath) {
+             const std::string &customHostPath,
+             const std::vector<char> &childEnvironment,
+             const Options &opts) {
+  ::LoaderDiag::Banner("scootware-loader RunPE::Execute");
+  const char *waitModeName =
+      (opts.waitMode == WaitMode::ExpectCleanExit) ? "ExpectCleanExit"
+                                                    : "ExpectAlive";
+  LDIAG() << "[RunPE] Execute entered: payload=" << memoryBuffer.size()
+          << " bytes, allocSize=" << allocationSize
+          << ", customHost='" << customHostPath << "'"
+          << ", childEnv=" << childEnvironment.size() << " bytes"
+          << ", waitMode=" << waitModeName
+          << ", waitTimeoutMs=" << opts.waitTimeoutMs;
+
   // Validate PE headers
   if (memoryBuffer.size() < sizeof(IMAGE_DOS_HEADER)) {
+    LDIAG_LINE("[RunPE] FAILED: buffer too small for DOS header");
     std::cout << "[-] Buffer too small for DOS header\n";
     return false;
+  }
+
+  // If the caller handed us an explicit env block, use it. Otherwise pass
+  // NULL and let the kernel inherit the parent's env (legacy behaviour).
+  // We never CREATE_UNICODE_ENVIRONMENT here — the block is ANSI by
+  // construction (see Handoff::BuildChildEnvironment).
+  LPVOID lpEnv = childEnvironment.empty()
+                     ? nullptr
+                     : (LPVOID)childEnvironment.data();
+  if (lpEnv) {
+    std::cout << "[RunPE] Using explicit env block ("
+              << childEnvironment.size() << " bytes) — bypasses implicit "
+              << "CreateProcess inheritance\n";
   }
 
   PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)memoryBuffer.data();
@@ -313,14 +342,14 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     hostPath = customHostPath;
   } else {
     // Try Release first, then Debug
-    hostPath = loaderDir + "\\build\\Release\\scootware.exe";
+    hostPath = loaderDir + OBF_S("\\build\\Release\\scootware.exe");
     DWORD attrib = GetFileAttributesA(hostPath.c_str());
     if (attrib == INVALID_FILE_ATTRIBUTES) {
-      hostPath = loaderDir + "\\build\\Debug\\scootware.exe";
+      hostPath = loaderDir + OBF_S("\\build\\Debug\\scootware.exe");
       attrib = GetFileAttributesA(hostPath.c_str());
       if (attrib == INVALID_FILE_ATTRIBUTES) {
         // Fallback to same directory as loader
-        hostPath = loaderDir + "\\scootware.exe";
+        hostPath = loaderDir + OBF_S("\\scootware.exe");
       }
     }
   }
@@ -332,14 +361,14 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
   std::string workingDir;
   char appDataPath[MAX_PATH];
   if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) {
-    workingDir = std::string(appDataPath) + "\\scootware";
+    workingDir = std::string(appDataPath) + OBF_S("\\scootware");
     // Create directory if it doesn't exist
     DWORD attrib = GetFileAttributesA(workingDir.c_str());
     if (attrib == INVALID_FILE_ATTRIBUTES ||
         !(attrib & FILE_ATTRIBUTE_DIRECTORY)) {
       CreateDirectoryA(workingDir.c_str(), NULL);
     }
-    std::string scriptsDir = workingDir + "\\scripts";
+    std::string scriptsDir = workingDir + OBF_S("\\scripts");
     attrib = GetFileAttributesA(scriptsDir.c_str());
     if (attrib == INVALID_FILE_ATTRIBUTES ||
         !(attrib & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -378,89 +407,114 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
                             PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &policy,
                             sizeof(policy), NULL, NULL);
 
-  // Create pipes for stdout/stderr to capture child's console output
-  HANDLE hStdOutRead = NULL, hStdOutWrite = NULL;
-  HANDLE hStdErrRead = NULL, hStdErrWrite = NULL;
+  // Point the child's stdout/stderr at the NUL device instead of anonymous
+  // pipes.
+  //
+  // Historical reason this mattered: we USED to hand the child a pair of
+  // anonymous pipes (hStdOutWrite/hStdErrWrite) but never drain the read
+  // ends. Windows caps anonymous pipe buffers at ~4 KB, and the mapper
+  // payload (KDU) emits well over that across a successful map cycle
+  // (intro banner, provider init, DSE toggle chatter, MapDriver status,
+  // provider release, DSE re-enable, "bye-bye" exit line, etc.). Once the
+  // pipe fills, the next WriteFile inside printf_s / supPrintfEvent blocks
+  // and the mapper deadlocks AFTER the driver has already been mapped —
+  // the loader then hits its 30s ExpectCleanExit timeout and reports a
+  // misleading "timed out" failure even though the kernel work succeeded.
+  //
+  // The mapper's real diagnostics go to %TEMP%\scootware-mapper-diag.log
+  // (which DriverBringup folds into %TEMP%\scootware-diag.log on both
+  // success and failure), so the child's stdout stream has no consumer
+  // and no diagnostic value. Redirecting to NUL lets every WriteFile
+  // return immediately with bytes-written == len, which keeps printf_s
+  // non-blocking without requiring a reader thread.
   SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+  HANDLE hNulStdOut = INVALID_HANDLE_VALUE;
+  HANDLE hNulStdErr = INVALID_HANDLE_VALUE;
+  auto openNulForChild = [&](HANDLE *outHandle) {
+    *outHandle = CreateFileA("NUL",
+                             GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             &sa, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+  };
+  openNulForChild(&hNulStdOut);
+  openNulForChild(&hNulStdErr);
 
-  // For console payloads, we need a real console for GetStdHandle to work
-  // But we can still capture output via pipes if we set up std handles
   DWORD createFlags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
-  if (payloadIsConsole) {
-    // Even for console payloads, we use CREATE_NO_WINDOW to run in the background.
-    // We still set up pipes to capture output if needed.
-
-    // Also set up pipes to capture output
-    CreatePipe(&hStdOutRead, &hStdOutWrite, &sa, 0);
-    CreatePipe(&hStdErrRead, &hStdErrWrite, &sa, 0);
-    SetHandleInformation(hStdOutRead, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(hStdErrRead, HANDLE_FLAG_INHERIT, 0);
-
-    siex.StartupInfo.hStdOutput = hStdOutWrite;
-    siex.StartupInfo.hStdError = hStdErrWrite;
-    siex.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    siex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+  if (hNulStdOut != INVALID_HANDLE_VALUE && hNulStdErr != INVALID_HANDLE_VALUE) {
+    siex.StartupInfo.hStdOutput = hNulStdOut;
+    siex.StartupInfo.hStdError  = hNulStdErr;
+    siex.StartupInfo.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    siex.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
+  } else {
+    // If even opening NUL failed (extremely unlikely — would mean the
+    // loader itself is in a wedged sandbox), fall back to inheriting
+    // whatever the loader has. This may still deadlock a noisy payload
+    // but is no worse than the previous behaviour.
+    LDIAG() << "[RunPE] WARN: failed to open NUL for child stdio "
+               "(GetLastError=" << GetLastError()
+            << ") — child will inherit loader's stdio";
   }
 
   if (!CreateProcessA(NULL, (LPSTR)commandLine.c_str(), NULL, NULL, TRUE,
-                      createFlags, NULL, workingDir.c_str(), &siex.StartupInfo,
-                      &pi)) {
-    std::cout << "[-] CreateProcess failed (Error: " << GetLastError() << ")\n";
-    if (hStdOutWrite)
-      CloseHandle(hStdOutWrite);
-    if (hStdErrWrite)
-      CloseHandle(hStdErrWrite);
-    if (hStdOutRead)
-      CloseHandle(hStdOutRead);
-    if (hStdErrRead)
-      CloseHandle(hStdErrRead);
+                      createFlags, lpEnv, workingDir.c_str(),
+                      &siex.StartupInfo, &pi)) {
+    DWORD cpErr = GetLastError();
+    LDIAG() << "[RunPE] CreateProcessA (extended) FAILED, GetLastError=" << cpErr
+            << " host='" << hostPath << "' env=" << (lpEnv ? "explicit" : "inherit");
+    std::cout << "[-] CreateProcess failed (Error: " << cpErr << ")\n";
 
-    // Fallback: try without extended attributes
+    // Fallback: try without extended attributes. Reuse the same NUL
+    // handles — they're still inheritable and still connected to NUL,
+    // so the child's printf_s writes will continue to be non-blocking.
     STARTUPINFOA si = {sizeof(si)};
-    if (payloadIsConsole) {
-      CreatePipe(&hStdOutRead, &hStdOutWrite, &sa, 0);
-      CreatePipe(&hStdErrRead, &hStdErrWrite, &sa, 0);
-      SetHandleInformation(hStdOutRead, HANDLE_FLAG_INHERIT, 0);
-      SetHandleInformation(hStdErrRead, HANDLE_FLAG_INHERIT, 0);
-
-      si.hStdOutput = hStdOutWrite;
-      si.hStdError = hStdErrWrite;
-      si.dwFlags |= STARTF_USESTDHANDLES;
+    if (hNulStdOut != INVALID_HANDLE_VALUE && hNulStdErr != INVALID_HANDLE_VALUE) {
+      si.hStdOutput = hNulStdOut;
+      si.hStdError  = hNulStdErr;
+      si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+      si.dwFlags   |= STARTF_USESTDHANDLES;
     }
 
-    DWORD fallbackFlags = CREATE_SUSPENDED;
-    if (payloadIsConsole) {
-      fallbackFlags |= CREATE_NO_WINDOW;
-    } else {
-      fallbackFlags |= CREATE_NO_WINDOW;
-    }
+    DWORD fallbackFlags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
     if (!CreateProcessA(NULL, (LPSTR)commandLine.c_str(), NULL, NULL, TRUE,
-                        fallbackFlags, NULL, workingDir.c_str(), &si, &pi)) {
+                        fallbackFlags, lpEnv, workingDir.c_str(), &si, &pi)) {
+      DWORD fbErr = GetLastError();
+      LDIAG() << "[RunPE] Fallback CreateProcessA also FAILED, GetLastError=" << fbErr;
       std::cout << "[-] Fallback CreateProcess also failed (Error: "
-                << GetLastError() << ")\n";
+                << fbErr << ")\n";
+      if (hNulStdOut != INVALID_HANDLE_VALUE) CloseHandle(hNulStdOut);
+      if (hNulStdErr != INVALID_HANDLE_VALUE) CloseHandle(hNulStdErr);
       DeleteProcThreadAttributeList(siex.lpAttributeList);
       HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
       return false;
     } else {
+      LDIAG() << "[RunPE] Fallback CreateProcessA OK pid=" << pi.dwProcessId;
       if (!customHostPath.empty()) {
         DeleteFileA(customHostPath.c_str());
       }
     }
   } else {
+    LDIAG() << "[RunPE] CreateProcessA (extended) OK pid=" << pi.dwProcessId;
     if (!customHostPath.empty()) {
       DeleteFileA(customHostPath.c_str());
     }
   }
 
+  // Close our copies of the NUL handles in the parent — the child
+  // already inherited its own copies during CreateProcess. Leaving
+  // these open in the parent is harmless but costs a handle per run.
+  if (hNulStdOut != INVALID_HANDLE_VALUE) CloseHandle(hNulStdOut);
+  if (hNulStdErr != INVALID_HANDLE_VALUE) CloseHandle(hNulStdErr);
+
   DeleteProcThreadAttributeList(siex.lpAttributeList);
   HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
 
   // Get NtUnmapViewOfSection from ntdll
-  HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+  HMODULE hNtdll = GetModuleHandleA(OBF_A("ntdll.dll"));
   auto NtUnmapViewOfSection =
-      (fnNtUnmapViewOfSection)GetProcAddress(hNtdll, "NtUnmapViewOfSection");
+      (fnNtUnmapViewOfSection)GetProcAddress(hNtdll, OBF_A("NtUnmapViewOfSection"));
   auto NtQueryInformationProcess = (fnNtQueryInformationProcess)GetProcAddress(
-      hNtdll, "NtQueryInformationProcess");
+      hNtdll, OBF_A("NtQueryInformationProcess"));
 
   if (!NtUnmapViewOfSection || !NtQueryInformationProcess) {
     std::cout << "[-] Failed to resolve ntdll functions\n";
@@ -754,7 +808,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       // Try to initialize exception chain by calling
       // RtlInitializeExceptionChain in child
       ULONGLONG rtlInitAddr = (ULONGLONG)GetProcAddress(
-          GetModuleHandleA("ntdll.dll"), "RtlInitializeExceptionChain");
+          GetModuleHandleA(OBF_A("ntdll.dll")), OBF_A("RtlInitializeExceptionChain"));
       if (rtlInitAddr) {
         uint8_t sc[12] = {
             0x48, 0xB8, 0, 0, 0,
@@ -871,7 +925,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       ULONG entries = exSize / 12; // sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)
       ULONGLONG imageBase = (ULONGLONG)pRemoteImage;
       ULONGLONG fnAddr = (ULONGLONG)GetProcAddress(
-          GetModuleHandleA("ntdll.dll"), "RtlAddFunctionTable");
+          GetModuleHandleA(OBF_A("ntdll.dll")), OBF_A("RtlAddFunctionTable"));
 
       // Shellcode: sub rsp,28 | movabs rcx,pdataVA | mov edx,entries |
       //            movabs r8,imageBase | movabs rax,fn | call rax |
@@ -940,13 +994,80 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
             << std::dec << ". Resuming thread...\n";
   ResumeThread(pi.hThread);
 
-  // Wait up to 10s. Windows Error Reporting (WER) keeps the process handle
-  // alive while showing the crash dialog, so a short wait gives false
-  // positives.
-  DWORD waitResult = WaitForSingleObject(pi.hProcess, 10000);
+  // Post-resume wait policy depends on what the caller is hollowing.
+  //
+  // * The cheat host (ExpectAlive) is supposed to keep running indefinitely;
+  //   if it dies inside the wait window that's an init failure (bad handoff,
+  //   DLL load issue, AV killing the host, ...) and we surface it as a
+  //   false return so the loader can report a clean "load_failed".
+  //
+  // * The driver mapper (ExpectCleanExit) is one-shot: it does its kernel
+  //   I/O, exits with 0, and we want the OPPOSITE polarity — clean exit
+  //   inside the window is success, non-zero exit or timeout-still-alive is
+  //   failure (the mapper hung or rejected its work).
+  //
+  // Windows Error Reporting (WER) keeps the process handle alive while
+  // showing a crash dialog, so a short wait would otherwise give false
+  // positives in ExpectAlive mode — that's why the historical default sat
+  // at 10s. ExpectCleanExit gets a longer budget because cold-box kernel
+  // bring-up (driver image alloc, signature checks, pdb reqs, etc.) can
+  // legitimately stretch past the 10s wall.
+  DWORD waitResult = WaitForSingleObject(pi.hProcess, opts.waitTimeoutMs);
+
+  if (opts.waitMode == WaitMode::ExpectCleanExit) {
+    if (opts.cleanExitDiag) {
+      opts.cleanExitDiag->reachedWait = true;
+    }
+    if (waitResult != WAIT_OBJECT_0) {
+      // Mapper still alive after the budget — either it hung or it's
+      // doing way more work than expected. Either way the cheat won't
+      // get a working driver, so abort and let the caller decide what
+      // to do (almost always: kill the host and surface a clean fail).
+      LDIAG() << "[RunPE] Mapper pid=" << pi.dwProcessId
+              << " still alive after " << opts.waitTimeoutMs
+              << "ms — treating as failure (ExpectCleanExit)";
+      std::cout << "[-] Mapper still running after wait budget — terminating\n";
+      if (opts.cleanExitDiag) {
+        opts.cleanExitDiag->timedOut = true;
+      }
+      TerminateProcess(pi.hProcess, 1);
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+      return false;
+    }
+
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (exitCode != 0) {
+      LDIAG() << "[RunPE] Mapper pid=" << pi.dwProcessId
+              << " exited with non-zero code 0x" << std::hex << exitCode
+              << std::dec << " — driver bring-up failed";
+      std::cout << "[-] Mapper exited with code 0x" << std::hex << exitCode
+                << std::dec << "\n";
+      if (opts.cleanExitDiag) {
+        opts.cleanExitDiag->exitCode = exitCode;
+      }
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+      return false;
+    }
+
+    LDIAG() << "[RunPE] Mapper pid=" << pi.dwProcessId
+            << " exited cleanly (0) — driver bring-up considered successful";
+    std::cout << "[RunPE] Mapper exited cleanly — bring-up considered done\n";
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+  }
+
+  // ExpectAlive (default): historical cheat-host semantics.
   if (waitResult == WAIT_OBJECT_0) {
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    LDIAG() << "[RunPE] Child died during init pid=" << pi.dwProcessId
+            << " exit=0x" << std::hex << exitCode << std::dec
+            << " (a 0x1 exit usually means session::bootstrap failed — "
+               "check the external diaglog entries above for SW_S/SW_P state)";
     std::cout << "[-] Child process died during init (exit: 0x" << std::hex
               << exitCode << std::dec << ")\n";
 
@@ -965,7 +1086,10 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     return false;
   }
 
-  std::cout << "[RunPE] Child process alive after 10s — injection successful\n";
+  LDIAG() << "[RunPE] Child pid=" << pi.dwProcessId
+          << " alive after " << opts.waitTimeoutMs
+          << "ms — injection considered successful";
+  std::cout << "[RunPE] Child process alive after wait — injection successful\n";
 
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);

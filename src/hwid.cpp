@@ -1,4 +1,5 @@
 #include "hwid.h"
+#include "security/obf.h"
 #include <windows.h>
 #include <iphlpapi.h>
 #include <intrin.h>
@@ -58,8 +59,8 @@ namespace Hwid {
     // Volume serial of the system drive.
     static std::string GetDiskSerial() {
         DWORD serial = 0;
-        if (!GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0))
-            return "00000000";
+        if (!GetVolumeInformationA(OBF_A("C:\\"), nullptr, 0, &serial, nullptr, nullptr, nullptr, 0))
+            return OBF_S("00000000");
         char buf[16] = {};
         snprintf(buf, sizeof(buf), "%08X", serial);
         return std::string(buf);
@@ -164,10 +165,10 @@ namespace Hwid {
     static std::string GetGpuName() {
         IDXGIFactory* factory = nullptr;
         if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
-            return "Unknown GPU";
+            return OBF_S("Unknown GPU");
 
         IDXGIAdapter* adapter = nullptr;
-        std::string name = "Unknown GPU";
+        std::string name = OBF_S("Unknown GPU");
         if (SUCCEEDED(factory->EnumAdapters(0, &adapter))) {
             DXGI_ADAPTER_DESC desc = {};
             if (SUCCEEDED(adapter->GetDesc(&desc))) {

@@ -25,6 +25,11 @@
 #include "memory/runpe.h"
 #include "vmdetect.h"
 #include "image_loader.h"
+#include "security/obf.h"
+#include "security/handoff.h"
+#include "security/driver_bringup.h"
+#include "util/process_wait.h"
+#include "util/diaglog.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // D3D11 plumbing
@@ -55,6 +60,8 @@ static AppState           g_lastState = AppState::Login;
 static float              g_screenFade = 1.0f;        // 0 → 1 fade-in on screen change
 static Api::AuthResponse  g_authInfo;
 static std::string        g_statusMessage = "";
+static bool               g_statusCopied = false;      // true for ~1.5s after user copies the status
+static double             g_statusCopiedTime = 0.0;    // ImGui::GetTime() at copy moment
 static char               g_username[64] = "";
 static char               g_password[64] = "";
 static bool               g_rememberMe = false;
@@ -63,6 +70,7 @@ static std::string        g_hwid = "";
 // Injection runs on a background thread so the UI stays responsive.
 static std::atomic<bool>  g_injecting{ false };
 static std::atomic<bool>  g_injectionSucceeded{ false };
+static std::atomic<bool>  g_injectionFailed{ false };   // asset/RunPE failure (not HWID mismatch)
 static std::atomic<bool>  g_shouldExit{ false };
 static std::atomic<uint64_t> g_autoCloseAt{ 0 };
 
@@ -583,6 +591,11 @@ static void DrawAvatar(ImVec2 origin, float size) {
 }
 
 // Launches a product on a background thread (extracted from the inline lambda).
+//
+// Reporting contract: exactly ONE loader event is emitted per injection attempt,
+// sent at the end of the cycle with the final outcome. This keeps the admin
+// panel clean (one row per launch click) instead of the multi-row cascade that
+// per-stage logging produces.
 static void LaunchProduct(const std::string& productId) {
     if (g_injecting.exchange(true)) return;
 
@@ -590,11 +603,62 @@ static void LaunchProduct(const std::string& productId) {
     g_hwidMismatch       = false;
     g_hwidResetSubmitted = false;
     g_hwidResetMessage   = "";
+    g_injectionFailed    = false;
     g_statusMessage      = "Streaming payload for " + productId + "...";
 
     std::string token = g_authInfo.token;
     std::string hwid  = g_hwid;
+
     std::thread([productId, token, hwid]() {
+        // Outcome accumulator — updated as we progress, reported exactly once
+        // at the very end of the injection cycle.
+        std::string finalEventType = OBF_S("load_failed");
+        std::string finalDetails   = OBF_S("unknown failure");
+
+        // ── Cold-start gate ───────────────────────────────────────────────
+        // If this product needs a host process (e.g. cs2.exe) and it isn't
+        // running yet, stall here with a "Waiting for game process..."
+        // status message instead of streaming the payload immediately.
+        // Reasons we want to stall, not bail:
+        //   * Streaming consumes a session-token use against the backend
+        //     (rate limited and audit-logged) — wasting one on a launch
+        //     that has nowhere to go is sloppy.
+        //   * The injected runtime would just sit in its own 60s wait loop
+        //     anyway (memory::initialize polls 120 × 500ms for cs2.exe),
+        //     and we'd lose the ability to show the user *why* nothing is
+        //     happening.
+        //   * The handoff env vars (SW_S/SW_P/SW_E) are set right before
+        //     RunPE and wiped right after; keeping that window tight is
+        //     important.
+        const std::wstring hostExe = ProcessWait::HostProcessFor(productId);
+        if (!hostExe.empty() && !ProcessWait::IsRunning(hostExe)) {
+            g_statusMessage = "Waiting for game process (" + productId + ")...";
+
+            const bool ok = ProcessWait::WaitForProcess(
+                hostExe,
+                /*cancel*/ []() { return false; }, // window close kills the process
+                /*tick  */ [productId](int seconds) {
+                    // Cosmetic countdown so the user sees the loader is
+                    // still alive and not hung.
+                    g_statusMessage =
+                        "Waiting for game process (" + productId + ")... "
+                        + std::to_string(seconds) + "s";
+                });
+
+            if (!ok) {
+                // Only reachable if WaitForProcess gets a cancel signal
+                // — currently never, but kept symmetric for future use.
+                g_statusMessage = "Cancelled — game process never started.";
+                g_injectionFailed = true;
+                Api::ReportLoaderEvent(OBF_S("load_failed"), productId, hwid,
+                    OBF_S("cold-start cancelled before host appeared"), token);
+                g_injecting = false;
+                return;
+            }
+
+            g_statusMessage = "Game process detected — streaming payload...";
+        }
+
         auto [hollowBuffer, hollowAllocSize] = Api::StreamAsset(productId, "hollow_exe", token, hwid);
         std::string customHostPath = "";
 
@@ -619,19 +683,136 @@ static void LaunchProduct(const std::string& productId) {
 
         auto [exeBuffer, allocSize] = Api::StreamAsset(productId, "primary_exe", token, hwid);
         if (!exeBuffer.empty()) {
-            if (RunPE::Execute(exeBuffer, allocSize, customHostPath)) {
+            // Stash session secrets in our env block for the host to inherit
+            // via CreateProcess. Wiped immediately after so the parent's env
+            // dump is clean even if a debugger snapshots us right after.
+            std::string expiresAt;
+            for (const auto& p : g_authInfo.subscriptions) {
+                if (p.productId == productId) { expiresAt = p.expiresAt; break; }
+            }
+
+            // Hard-fail BEFORE we burn a stream + spawn the host if the
+            // session token never made it back from /api/auth/login. Without
+            // it Handoff::Set bails early, the env channel never publishes,
+            // and the external boots into "no loader handoff" — which the
+            // crack-attempt reporter then dutifully fires off, polluting the
+            // admin panel with false positives every time the auth response
+            // shape drifts. Surface it loudly here instead.
+            if (token.empty()) {
+                LDIAG_LINE("[inject] aborting — empty session token from Api::Login "
+                           "(server probably returned no `sessionId`/`token` field). "
+                           "Handoff would silently produce a no-handoff trip on the external.");
+                g_statusMessage   = "Login session token missing — please re-login.";
+                g_injectionFailed = true;
+                Api::ReportLoaderEvent(OBF_S("load_failed"), productId, hwid,
+                    OBF_S("aborted before spawn: empty session token from /api/auth/login"),
+                    /*token*/ "");
+                if (!customHostPath.empty()) DeleteFileA(customHostPath.c_str());
+                g_injecting = false;
+                return;
+            }
+
+            bool handoffOk = Handoff::Set(token, hwid, productId, expiresAt);
+            if (!handoffOk) {
+                LDIAG_LINE("[inject] aborting — Handoff::Set failed (no SW_S/SW_P "
+                           "in env or shmem). Spawning would trip no-handoff on the external.");
+                g_statusMessage   = "Internal error: handoff publish failed.";
+                g_injectionFailed = true;
+                Api::ReportLoaderEvent(OBF_S("load_failed"), productId, hwid,
+                    OBF_S("aborted before spawn: Handoff::Set returned false"),
+                    token);
+                if (!customHostPath.empty()) DeleteFileA(customHostPath.c_str());
+                g_injecting = false;
+                return;
+            }
+
+            // ── Kernel driver bring-up ─────────────────────────────────────
+            // Done HERE (loader, elevated, before the cheat is hollowed)
+            // instead of in the cheat itself. The user already gave UAC
+            // consent to launch the loader; the cheat shouldn't have to
+            // ask for it a second time mid-render.
+            //
+            // The mapper EXE is hollowed into its OWN scootware.exe
+            // instance (using the same hollow_exe binary we just streamed
+            // for the cheat host, hence we hand the buffer in here so
+            // Api::StreamAsset isn't burned a second time on the same
+            // payload). Both processes share the same image name in the
+            // task list, but the mapper exits as soon as the kernel side
+            // is up and only the cheat persists.
+            //
+            // If this fails we abort the whole launch — there's no point
+            // hollowing the cheat if the driver isn't going to be there
+            // for it to talk to.
+            g_statusMessage = "Bringing up kernel driver...";
+            DriverBringup::Outcome drv = DriverBringup::Run(
+                productId, token, hwid, hollowBuffer, hollowAllocSize);
+            if (drv.result != DriverBringup::Result::Success) {
+                LDIAG() << "[inject] aborting — DriverBringup::Run failed: "
+                        << drv.details;
+                g_statusMessage   = "Driver bring-up failed: " + drv.details;
+                g_injectionFailed = true;
+                Api::ReportLoaderEvent(OBF_S("load_failed"), productId, hwid,
+                    OBF_S("aborted before spawn: driver bring-up failed — ")
+                        + drv.details,
+                    token);
+                Handoff::Wipe();
+                if (!customHostPath.empty()) DeleteFileA(customHostPath.c_str());
+                g_injecting = false;
+                return;
+            }
+            g_statusMessage = "Driver online — injecting cheat...";
+
+            // Build the env block AFTER Handoff::Set so SW_S/SW_P/SW_E
+            // are baked in. We pass it explicitly to RunPE so the child
+            // gets the secrets via lpEnvironment instead of relying on
+            // CreateProcess implicit inheritance — process hollowing's
+            // CreateRemoteThread + LdrInitializeThunk dance can race
+            // with implicit env inheritance and silently strip them.
+            std::vector<char> childEnv = Handoff::BuildChildEnvironment();
+
+            bool injected = RunPE::Execute(exeBuffer, allocSize,
+                                            customHostPath, childEnv);
+
+            // We deliberately leave the Local\SW_HANDOFF_<pid> shmem
+            // mapping open across the auto-close window (~1.5s after
+            // success) so a slow child still finds it. Wipe() runs in
+            // the auto-close path immediately before exit; until then
+            // the section is held open by this process.
+            Handoff::Wipe();
+
+            if (injected) {
                 g_statusMessage      = "Injected successfully — closing loader...";
                 g_injectionSucceeded = true;
                 g_autoCloseAt        = (uint64_t)GetTickCount64() + 1500;
+                finalEventType = OBF_S("load_success");
+                finalDetails   = OBF_S("primary_exe injected via RunPE");
             } else {
-                g_statusMessage = "Injection failed (RunPE error).";
+                g_statusMessage   = "Injection failed (RunPE error).";
+                g_injectionFailed = true;
+                finalEventType = OBF_S("load_failed");
+                finalDetails   = OBF_S("RunPE::Execute returned false");
             }
         } else {
             g_hwidMismatch = Api::LastStreamWasHwidMismatch();
-            g_statusMessage = g_hwidMismatch
-                ? "HWID mismatch — this account is bound to a different machine."
-                : "Failed to stream asset from secure server.";
+            if (g_hwidMismatch) {
+                g_statusMessage = "HWID mismatch — this account is bound to a different machine.";
+                // HWID mismatch is ALSO logged server-side from the stream
+                // endpoint (tamper-resistant). We skip client reporting here
+                // to avoid duplicate rows in the admin panel.
+                finalEventType = "";
+            } else {
+                g_statusMessage   = "Failed to stream asset from secure server.";
+                g_injectionFailed = true;
+                finalEventType = OBF_S("load_failed");
+                finalDetails   = OBF_S("stream request failed (primary_exe unavailable)");
+            }
         }
+
+        // Single consolidated report for the whole injection cycle.
+        if (!finalEventType.empty()) {
+            Api::ReportLoaderEvent(finalEventType, productId, hwid, finalDetails, token);
+        }
+
         g_injecting = false;
     }).detach();
 }
@@ -908,10 +1089,49 @@ static void DrawInjectingScreen() {
     ImGui::Dummy(ImVec2(0, 6));
 
     // Status message panel
+    //
+    // The message can be anything from a short "Streaming payload..." to a
+    // verbose error with an exit code baked in. We wrap it so long errors
+    // stay inside the panel, and make the whole panel click-to-copy so
+    // users can paste the full string when asking for support.
     ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_PANEL);
     ImGui::BeginChild("##status", ImVec2(avail, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ImGui::TextColored(COL_TEXT_DIM, "%s", g_statusMessage.c_str());
+    {
+        ImVec2 panelMin = ImGui::GetCursorScreenPos();
+        float  wrapW    = ImGui::GetContentRegionAvail().x;
+
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT_DIM);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextUnformatted(g_statusMessage.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+
+        // Invisible hit-region over the text we just drew so the whole
+        // block is clickable (and shows a tooltip) without having to use
+        // a selectable, which would repaint the background.
+        ImVec2 panelMax = ImVec2(panelMin.x + wrapW,
+                                 ImGui::GetCursorScreenPos().y);
+        ImGui::SetCursorScreenPos(panelMin);
+        ImGui::InvisibleButton("##status_copy",
+                               ImVec2(wrapW, panelMax.y - panelMin.y));
+        if (ImGui::IsItemHovered() && !g_statusMessage.empty()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("%s", g_statusCopied
+                                        ? "Copied to clipboard"
+                                        : "Click to copy");
+        }
+        if (ImGui::IsItemClicked() && !g_statusMessage.empty()) {
+            ImGui::SetClipboardText(g_statusMessage.c_str());
+            g_statusCopied     = true;
+            g_statusCopiedTime = ImGui::GetTime();
+        }
+        // Auto-reset the "Copied" tooltip after a short while so the next
+        // hover shows "Click to copy" again.
+        if (g_statusCopied && ImGui::GetTime() - g_statusCopiedTime > 1.5) {
+            g_statusCopied = false;
+        }
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
@@ -965,18 +1185,33 @@ static void DrawInjectingScreen() {
     ImGui::Dummy(ImVec2(0, 10));
 
     // Bottom action
-    if (injectionLocked) {
+    //
+    // Single-attempt policy: once the user clicks "Launch", the loader commits
+    // to one injection cycle. No matter the outcome, we do NOT send them back
+    // to the product library — they can only close the loader.
+    //   * Success       → auto-close after 1500ms (set in LaunchProduct).
+    //   * Still working → show "Working — please wait..." text (no button).
+    //   * HWID mismatch → existing reset flow is shown above; this row offers
+    //                     a Close button so the user can dismiss after reading
+    //                     the admin-review message.
+    //   * Asset/RunPE failure → user must click Close to dismiss. This gives
+    //                     them time to read the error before the app exits.
+    if (injectionLocked && !succeeded) {
         if (g_fontSmall) ImGui::PushFont(g_fontSmall);
-        ImGui::TextColored(COL_TEXT_FAINT,
-            succeeded ? "The loader will close automatically."
-                      : "Working — please wait...");
+        ImGui::TextColored(COL_TEXT_FAINT, "Working — please wait...");
+        if (g_fontSmall) ImGui::PopFont();
+    } else if (succeeded) {
+        if (g_fontSmall) ImGui::PushFont(g_fontSmall);
+        ImGui::TextColored(COL_TEXT_FAINT, "The loader will close automatically.");
         if (g_fontSmall) ImGui::PopFont();
     } else {
-        if (GhostButton("← Back to Library", ImVec2(avail, 36))) {
-            GotoState(AppState::Products);
-            g_hwidMismatch = false;
-            g_hwidResetSubmitted = false;
-            g_hwidResetMessage = "";
+        // Injection attempt completed without success. Offer a single action:
+        // dismiss the error / reset message and exit the loader.
+        const char* label = g_hwidMismatch
+            ? "Close Loader"
+            : "Dismiss and Close";
+        if (GhostButton(label, ImVec2(avail, 36))) {
+            g_shouldExit = true;
         }
     }
 }
@@ -1004,27 +1239,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     // Generate hardware fingerprint used for HWID binding
     g_hwid = Hwid::GetHWID();
     if (g_hwid.empty()) {
-        std::cout << "[HWID] Warning: Failed to generate HWID, using fallback.\n";
-        g_hwid = "UNKNOWN";
+        std::cout << OBF_S("[HWID] Warning: Failed to generate HWID, using fallback.\n");
+        g_hwid = OBF_S("UNKNOWN");
     } else {
-        std::cout << "[HWID] " << g_hwid << "\n";
+        std::cout << OBF_S("[HWID] ") << g_hwid << "\n";
     }
 
     // ── DPI awareness so we render crisply on any monitor ───────────────
     {
         // Per-monitor V2 if available (Win10 1703+); fall back gracefully.
         typedef BOOL (WINAPI *PFN_SetCtx)(DPI_AWARENESS_CONTEXT);
-        HMODULE u32 = ::GetModuleHandleW(L"user32.dll");
-        if (auto setCtx = (PFN_SetCtx)::GetProcAddress(u32, "SetProcessDpiAwarenessContext")) {
+        HMODULE u32 = ::GetModuleHandleW(OBF_C(L"user32.dll"));
+        if (auto setCtx = (PFN_SetCtx)::GetProcAddress(u32, OBF_A("SetProcessDpiAwarenessContext"))) {
             setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        } else if (auto setCtxOld = (PFN_SetCtx)::GetProcAddress(u32, "SetProcessDPIAware")) {
+        } else if (auto setCtxOld = (PFN_SetCtx)::GetProcAddress(u32, OBF_A("SetProcessDPIAware"))) {
             ((BOOL (WINAPI *)())setCtxOld)();
         }
 
         // Get DPI for the primary monitor (good enough — we don't move between displays often).
         UINT dpi = 96;
         typedef UINT (WINAPI *PFN_GetSysDpi)();
-        if (auto getSysDpi = (PFN_GetSysDpi)::GetProcAddress(u32, "GetDpiForSystem")) {
+        if (auto getSysDpi = (PFN_GetSysDpi)::GetProcAddress(u32, OBF_A("GetDpiForSystem"))) {
             dpi = getSysDpi();
         } else {
             HDC hdc = ::GetDC(nullptr);
@@ -1092,10 +1327,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     cfg.OversampleV = 2;
     cfg.PixelSnapH  = true;
 
-    g_fontBody  = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",  SX(17.0f), &cfg, ranges);
-    g_fontSmall = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",  SX(14.0f), &cfg, ranges);
-    g_fontTitle = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", SX(22.0f), &cfg, ranges);
-    g_fontHero  = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", SX(30.0f), &cfg, ranges);
+    g_fontBody  = io.Fonts->AddFontFromFileTTF(OBF_A("C:\\Windows\\Fonts\\segoeui.ttf"),  SX(17.0f), &cfg, ranges);
+    g_fontSmall = io.Fonts->AddFontFromFileTTF(OBF_A("C:\\Windows\\Fonts\\segoeui.ttf"),  SX(14.0f), &cfg, ranges);
+    g_fontTitle = io.Fonts->AddFontFromFileTTF(OBF_A("C:\\Windows\\Fonts\\segoeuib.ttf"), SX(22.0f), &cfg, ranges);
+    g_fontHero  = io.Fonts->AddFontFromFileTTF(OBF_A("C:\\Windows\\Fonts\\segoeuib.ttf"), SX(30.0f), &cfg, ranges);
     if (!g_fontBody) {
         io.Fonts->AddFontDefault();
     }

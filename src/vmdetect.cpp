@@ -20,6 +20,7 @@
  */
 
 #include "vmdetect.h"
+#include "security/obf.h"
 
 #include <windows.h>
 #include <winternl.h>
@@ -84,61 +85,58 @@ bool CheckHypervisorVendorString(std::string& outVendor)
     vendor[12] = '\0';
     outVendor  = vendor;
 
-    static const char* known[] = {
-        "KVMKVMKVM",    // KVM (Linux)
-        // "Microsoft Hv" excluded — native Windows VBS/Hyper-V on bare metal
-        "VMwareVMware", // VMware
-        "VBoxVBoxVBox", // VirtualBox
-        "XenVMMXenVMM", // Xen
-        "prl hyperv",   // Parallels
-        "TCGTCGTCGTCG", // QEMU/TCG
-        nullptr
+    static const std::vector<std::string> known = {
+        OBF_S("KVMKVMKVM"),
+        OBF_S("VMwareVMware"),
+        OBF_S("VBoxVBoxVBox"),
+        OBF_S("XenVMMXenVMM"),
+        OBF_S("prl hyperv"),
+        OBF_S("TCGTCGTCGTCG"),
     };
 
     std::string lower = outVendor;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-    for (int i = 0; known[i]; ++i) {
-        std::string k = known[i];
-        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
-        if (lower.find(k) != std::string::npos)
+    for (const auto& k : known) {
+        std::string ks = k;
+        std::transform(ks.begin(), ks.end(), ks.begin(), ::tolower);
+        if (lower.find(ks) != std::string::npos)
             return true;
     }
     return false;
 }
 
 // ── 3. Registry key check ─────────────────────────────────────────────────
-struct RegEntry { HKEY hive; const wchar_t* path; };
+struct RegEntry { HKEY hive; std::wstring path; };
 
 bool CheckRegistryKeys()
 {
-    static const RegEntry keys[] = {
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\VMware, Inc.\\VMware Tools" },
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Oracle\\VirtualBox Guest Additions" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\VBoxGuest" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\VBoxMouse" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\VBoxService" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\VBoxSF" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\VBoxVideo" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmci" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmhgfs" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmmouse" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmrawdsk" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmusbmouse" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmvss" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vm3dmp" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmxnet" },
-        { HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\vmx_svga" },
-        { HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\DSDT\\VBOX__" },
-        { HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\FADT\\VBOX__" },
-        { HKEY_LOCAL_MACHINE, L"HARDWARE\\ACPI\\RSDT\\VBOX__" },
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters" },
-        { nullptr, nullptr }
+    static const std::vector<RegEntry> keys = {
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SOFTWARE\\VMware, Inc.\\VMware Tools") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SOFTWARE\\Oracle\\VirtualBox Guest Additions") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\VBoxGuest") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\VBoxMouse") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\VBoxService") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\VBoxSF") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\VBoxVideo") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmci") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmhgfs") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmmouse") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmrawdsk") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmusbmouse") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmvss") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vm3dmp") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmxnet") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SYSTEM\\CurrentControlSet\\Services\\vmx_svga") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"HARDWARE\\ACPI\\DSDT\\VBOX__") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"HARDWARE\\ACPI\\FADT\\VBOX__") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"HARDWARE\\ACPI\\RSDT\\VBOX__") },
+        { HKEY_LOCAL_MACHINE, OBF_W(L"SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters") },
     };
 
-    for (int i = 0; keys[i].path; ++i) {
+    for (const auto& e : keys) {
         HKEY hk = nullptr;
-        if (RegOpenKeyExW(keys[i].hive, keys[i].path, 0, KEY_READ, &hk) == ERROR_SUCCESS) {
+        if (RegOpenKeyExW(e.hive, e.path.c_str(), 0, KEY_READ, &hk) == ERROR_SUCCESS) {
             RegCloseKey(hk);
             return true;
         }
@@ -154,7 +152,7 @@ HANDLE TakeProcessSnapshot()
     return CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 }
 
-bool MatchProcessList(HANDLE snap, const wchar_t* const* list, std::string& outName)
+bool MatchProcessList(HANDLE snap, const std::vector<std::wstring>& list, std::string& outName)
 {
     if (snap == INVALID_HANDLE_VALUE)
         return false;
@@ -169,8 +167,8 @@ bool MatchProcessList(HANDLE snap, const wchar_t* const* list, std::string& outN
         std::wstring lower = pe.szExeFile;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
-        for (int i = 0; list[i]; ++i) {
-            if (lower == list[i]) {
+        for (const auto& candidate : list) {
+            if (lower == candidate) {
                 outName = WtoA(pe.szExeFile);
                 return true;
             }
@@ -182,21 +180,20 @@ bool MatchProcessList(HANDLE snap, const wchar_t* const* list, std::string& outN
 
 bool CheckVMProcesses(HANDLE snap, std::string& outName)
 {
-    static const wchar_t* vmProcs[] = {
-        L"vmtoolsd.exe",
-        L"vmwaretray.exe",
-        L"vmwareuser.exe",
-        L"vboxservice.exe",
-        L"vboxtray.exe",
-        L"vboxclient.exe",
-        L"xenservice.exe",
-        L"qemu-ga.exe",
-        L"prl_tools.exe",
-        L"prl_cc.exe",
-        L"vmacthlp.exe",
-        L"vmnat.exe",
-        L"vmnetdhcp.exe",
-        nullptr
+    static const std::vector<std::wstring> vmProcs = {
+        OBF_W(L"vmtoolsd.exe"),
+        OBF_W(L"vmwaretray.exe"),
+        OBF_W(L"vmwareuser.exe"),
+        OBF_W(L"vboxservice.exe"),
+        OBF_W(L"vboxtray.exe"),
+        OBF_W(L"vboxclient.exe"),
+        OBF_W(L"xenservice.exe"),
+        OBF_W(L"qemu-ga.exe"),
+        OBF_W(L"prl_tools.exe"),
+        OBF_W(L"prl_cc.exe"),
+        OBF_W(L"vmacthlp.exe"),
+        OBF_W(L"vmnat.exe"),
+        OBF_W(L"vmnetdhcp.exe"),
     };
     return MatchProcessList(snap, vmProcs, outName);
 }
@@ -204,21 +201,24 @@ bool CheckVMProcesses(HANDLE snap, std::string& outName)
 // ── 5. Known VM service names ─────────────────────────────────────────────
 bool CheckVMServices()
 {
-    static const wchar_t* vmSvcs[] = {
-        L"VBoxGuest", L"VBoxMouse", L"VBoxService", L"VBoxSF", L"VBoxVideo",
-        L"vmci",      L"vmhgfs",    L"vmmouse",     L"VMTools",
-        L"vmvss",     L"vmx_svga",  L"vmxnet",
-        L"xenevtchn", L"xenfilt",   L"xennet",      L"xenpci", L"xensvc", L"xenvbd",
-        L"prl_strg",
-        nullptr
+    static const std::vector<std::wstring> vmSvcs = {
+        OBF_W(L"VBoxGuest"), OBF_W(L"VBoxMouse"), OBF_W(L"VBoxService"),
+        OBF_W(L"VBoxSF"),    OBF_W(L"VBoxVideo"),
+        OBF_W(L"vmci"),      OBF_W(L"vmhgfs"),    OBF_W(L"vmmouse"),
+        OBF_W(L"VMTools"),
+        OBF_W(L"vmvss"),     OBF_W(L"vmx_svga"),  OBF_W(L"vmxnet"),
+        OBF_W(L"xenevtchn"), OBF_W(L"xenfilt"),   OBF_W(L"xennet"),
+        OBF_W(L"xenpci"),    OBF_W(L"xensvc"),    OBF_W(L"xenvbd"),
+        OBF_W(L"prl_strg"),
     };
 
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
     if (!scm) return false;
 
     bool found = false;
-    for (int i = 0; vmSvcs[i] && !found; ++i) {
-        SC_HANDLE svc = OpenServiceW(scm, vmSvcs[i], SERVICE_QUERY_STATUS);
+    for (const auto& name : vmSvcs) {
+        if (found) break;
+        SC_HANDLE svc = OpenServiceW(scm, name.c_str(), SERVICE_QUERY_STATUS);
         if (svc) { CloseServiceHandle(svc); found = true; }
     }
 
@@ -315,11 +315,11 @@ bool CheckRemoteDebugger()
 // A non-zero debug port means a kernel-mode debugger is attached.
 bool CheckDebugPort()
 {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = GetModuleHandleW(OBF_C(L"ntdll.dll"));
     if (!ntdll) return false;
 
     auto NtQIP = reinterpret_cast<pfnNtQIP>(
-        GetProcAddress(ntdll, "NtQueryInformationProcess"));
+        GetProcAddress(ntdll, OBF_A("NtQueryInformationProcess")));
     if (!NtQIP) return false;
 
     ULONG_PTR debugPort = 0;
@@ -368,68 +368,66 @@ bool CheckHardwareBreakpoints()
 // ── 13. Known debugger / analysis-tool process names ─────────────────────
 bool CheckDebuggerProcesses(HANDLE snap, std::string& outName)
 {
-    static const wchar_t* dbgProcs[] = {
+    static const std::vector<std::wstring> dbgProcs = {
         // Debuggers
-        L"x64dbg.exe",
-        L"x32dbg.exe",
-        L"ollydbg.exe",
-        L"windbg.exe",
-        L"windbg64.exe",
-        L"dbgview.exe",      // Sysinternals DebugView
-        L"idaq.exe",         // IDA Pro 32-bit
-        L"idaq64.exe",       // IDA Pro 64-bit
-        L"idaw.exe",
-        L"idaw64.exe",
-        L"ida.exe",
-        L"ida64.exe",
-        L"radare2.exe",
-        L"r2.exe",
-        L"cutter.exe",       // Cutter (radare2 GUI)
-        L"binaryninja.exe",  // Binary Ninja
-        L"ghidra.exe",
-        L"ghidrarun.exe",
+        OBF_W(L"x64dbg.exe"),
+        OBF_W(L"x32dbg.exe"),
+        OBF_W(L"ollydbg.exe"),
+        OBF_W(L"windbg.exe"),
+        OBF_W(L"windbg64.exe"),
+        OBF_W(L"dbgview.exe"),
+        OBF_W(L"idaq.exe"),
+        OBF_W(L"idaq64.exe"),
+        OBF_W(L"idaw.exe"),
+        OBF_W(L"idaw64.exe"),
+        OBF_W(L"ida.exe"),
+        OBF_W(L"ida64.exe"),
+        OBF_W(L"radare2.exe"),
+        OBF_W(L"r2.exe"),
+        OBF_W(L"cutter.exe"),
+        OBF_W(L"binaryninja.exe"),
+        OBF_W(L"ghidra.exe"),
+        OBF_W(L"ghidrarun.exe"),
 
         // Monitoring / analysis
-        L"procmon.exe",      // Process Monitor
-        L"procmon64.exe",
-        L"procexp.exe",      // Process Explorer
-        L"procexp64.exe",
-        L"processhacker.exe",
-        L"systeminformer.exe",
-        L"wireshark.exe",
-        L"fiddler.exe",
-        L"fiddler4.exe",
-        L"charles.exe",
-        L"httpdebugger.exe",
-        L"tcpview.exe",
-        L"apimonitor.exe",
-        L"apimonitor-x64.exe",
-        L"apimonitor-x86.exe",
-        L"regmon.exe",
-        L"filemon.exe",
+        OBF_W(L"procmon.exe"),
+        OBF_W(L"procmon64.exe"),
+        OBF_W(L"procexp.exe"),
+        OBF_W(L"procexp64.exe"),
+        OBF_W(L"processhacker.exe"),
+        OBF_W(L"systeminformer.exe"),
+        OBF_W(L"wireshark.exe"),
+        OBF_W(L"fiddler.exe"),
+        OBF_W(L"fiddler4.exe"),
+        OBF_W(L"charles.exe"),
+        OBF_W(L"httpdebugger.exe"),
+        OBF_W(L"tcpview.exe"),
+        OBF_W(L"apimonitor.exe"),
+        OBF_W(L"apimonitor-x64.exe"),
+        OBF_W(L"apimonitor-x86.exe"),
+        OBF_W(L"regmon.exe"),
+        OBF_W(L"filemon.exe"),
 
         // Memory / RE tools
-        L"cheatengine.exe",
-        L"cheatengine-x86_64.exe",
-        L"cheatengine-i386.exe",
-        L"scylla_x64.exe",
-        L"scylla_x86.exe",
-        L"importrec.exe",
-        L"imprec.exe",
-        L"lordpe.exe",
-        L"reshacker.exe",
-        L"hxd.exe",
-        L"hexeditor.exe",
+        OBF_W(L"cheatengine.exe"),
+        OBF_W(L"cheatengine-x86_64.exe"),
+        OBF_W(L"cheatengine-i386.exe"),
+        OBF_W(L"scylla_x64.exe"),
+        OBF_W(L"scylla_x86.exe"),
+        OBF_W(L"importrec.exe"),
+        OBF_W(L"imprec.exe"),
+        OBF_W(L"lordpe.exe"),
+        OBF_W(L"reshacker.exe"),
+        OBF_W(L"hxd.exe"),
+        OBF_W(L"hexeditor.exe"),
 
         // Sandboxes / auto-analysis
-        L"vmsrvc.exe",
-        L"vmusrvc.exe",
-        L"peid.exe",
-        L"exeinfope.exe",
-        L"die.exe",          // Detect-It-Easy
-        L"pestudio.exe",
-
-        nullptr
+        OBF_W(L"vmsrvc.exe"),
+        OBF_W(L"vmusrvc.exe"),
+        OBF_W(L"peid.exe"),
+        OBF_W(L"exeinfope.exe"),
+        OBF_W(L"die.exe"),
+        OBF_W(L"pestudio.exe"),
     };
 
     return MatchProcessList(snap, dbgProcs, outName);
@@ -462,92 +460,76 @@ DetectionResult Check()
 
     // ── Anti-debug checks ─────────────────────────────────────────────────
 
-    // 8. IsDebuggerPresent
     if (CheckIsDebuggerPresent()) {
         result.isDebugger = true;
-        result.triggers.push_back("Debugger attached (IsDebuggerPresent)");
+        result.triggers.push_back(OBF_S("Debugger attached (IsDebuggerPresent)"));
     }
 
-    // 9. Remote debugger
     if (CheckRemoteDebugger()) {
         result.isDebugger = true;
-        result.triggers.push_back("Remote debugger detected (CheckRemoteDebuggerPresent)");
+        result.triggers.push_back(OBF_S("Remote debugger detected (CheckRemoteDebuggerPresent)"));
     }
 
-    // 10. Debug port via NtQueryInformationProcess
     if (CheckDebugPort()) {
         result.isDebugger = true;
-        result.triggers.push_back("Kernel debug port active (NtQueryInformationProcess ProcessDebugPort)");
+        result.triggers.push_back(OBF_S("Kernel debug port active (NtQueryInformationProcess ProcessDebugPort)"));
     }
 
-    // 11. Heap flags (debug heap)
     if (CheckHeapFlags()) {
         result.isDebugger = true;
-        result.triggers.push_back("Debug heap flags set (PEB HeapForceFlags != 0)");
+        result.triggers.push_back(OBF_S("Debug heap flags set (PEB HeapForceFlags != 0)"));
     }
 
-    // 12. Hardware breakpoints (Dr0-Dr3)
     if (CheckHardwareBreakpoints()) {
         result.isDebugger = true;
-        result.triggers.push_back("Hardware breakpoint(s) set (GetThreadContext Dr0-Dr3)");
+        result.triggers.push_back(OBF_S("Hardware breakpoint(s) set (GetThreadContext Dr0-Dr3)"));
     }
 
-    // ── Process snapshot (shared by checks 4 and 13) ──────────────────────
     HANDLE snap = TakeProcessSnapshot();
 
-    // 13. Known debugger / analysis-tool processes
     std::string toolName;
     if (CheckDebuggerProcesses(snap, toolName)) {
         result.isDebugger = true;
-        result.triggers.push_back("Analysis tool running: " + toolName);
+        result.triggers.push_back(OBF_S("Analysis tool running: ") + toolName);
     }
 
-    // ── VM-environment checks ─────────────────────────────────────────────
-
-    // 1. CPUID hypervisor bit (disabled — see stub comment)
     if (CheckCPUIDHypervisorBit()) {
         result.isVMEnv = true;
-        result.triggers.push_back("CPUID hypervisor bit set (ECX bit 31)");
+        result.triggers.push_back(OBF_S("CPUID hypervisor bit set (ECX bit 31)"));
     }
 
-    // 2. CPUID hypervisor vendor string
     std::string vendor;
     if (CheckHypervisorVendorString(vendor)) {
         result.isVMEnv = true;
-        result.triggers.push_back("Hypervisor vendor string: " + vendor);
+        result.triggers.push_back(OBF_S("Hypervisor vendor string: ") + vendor);
     }
 
-    // 3. VM registry keys
     if (CheckRegistryKeys()) {
         result.isVMEnv = true;
-        result.triggers.push_back("VM registry key present");
+        result.triggers.push_back(OBF_S("VM registry key present"));
     }
 
-    // 4. VM process names (reuse snapshot)
     std::string vmProcName;
     if (CheckVMProcesses(snap, vmProcName)) {
         result.isVMEnv = true;
-        result.triggers.push_back("VM process running: " + vmProcName);
+        result.triggers.push_back(OBF_S("VM process running: ") + vmProcName);
     }
 
     CloseHandle(snap);
 
-    // 5. VM services
     if (CheckVMServices()) {
         result.isVMEnv = true;
-        result.triggers.push_back("VM service present");
+        result.triggers.push_back(OBF_S("VM service present"));
     }
 
-    // 6. VM MAC address OUI
     if (CheckMacAddress()) {
         result.isVMEnv = true;
-        result.triggers.push_back("All NICs have VM MAC address OUI");
+        result.triggers.push_back(OBF_S("All NICs have VM MAC address OUI"));
     }
 
-    // 7. RDTSC timing anomaly
     if (CheckRDTSCTiming()) {
         result.isVMEnv = true;
-        result.triggers.push_back("RDTSC timing anomaly (VM exit overhead)");
+        result.triggers.push_back(OBF_S("RDTSC timing anomaly (VM exit overhead)"));
     }
 
     result.isVM = result.isDebugger || result.isVMEnv;

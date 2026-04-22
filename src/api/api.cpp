@@ -1,4 +1,5 @@
 #include "api.h"
+#include "../security/obf.h"
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -33,14 +34,10 @@ namespace Api {
     };
 
     ApiSettings GetSettings() {
-        // Default to production domain
-        ApiSettings s = { L"scootware.us", 443, true };
+        ApiSettings s = { OBF_W(L"scootware.us"), 443, true };
 
-        // For local development, check if we can reach localhost:3000
-        // In a real app, you might check a 'config.json' file here.
-        // We'll add a simple check for a local file if it exists.
-        if (GetFileAttributesA("dev_mode.txt") != INVALID_FILE_ATTRIBUTES) {
-            s.host = L"localhost";
+        if (GetFileAttributesA(OBF_A("dev_mode.txt")) != INVALID_FILE_ATTRIBUTES) {
+            s.host = OBF_W(L"localhost");
             s.port = 3000;
             s.secure = false;
         }
@@ -65,7 +62,7 @@ namespace Api {
         HttpResponse response = { false, "", 0, 0 };
         ApiSettings settings = GetSettings();
         
-        HINTERNET hSession = WinHttpOpen(L"ScootwareLoader/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        HINTERNET hSession = WinHttpOpen(OBF_C(L"ScootwareLoader/1.0"), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) return response;
 
         HINTERNET hConnect = WinHttpConnect(hSession, settings.host.c_str(), settings.port, 0);
@@ -80,14 +77,14 @@ namespace Api {
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, wMethod.c_str(), wPath.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, (settings.secure ? WINHTTP_FLAG_SECURE : 0));
         
         if (hRequest) {
-            std::wstring headers = L"Content-Type: application/json\r\n";
+            std::wstring headers = OBF_W(L"Content-Type: application/json\r\n");
             if (!token.empty()) {
                 std::wstring wToken(token.begin(), token.end());
-                headers += L"Authorization: Bearer " + wToken + L"\r\n";
+                headers += OBF_W(L"Authorization: Bearer ") + wToken + OBF_W(L"\r\n");
             }
             if (!hwid.empty()) {
                 std::wstring wHwid(hwid.begin(), hwid.end());
-                headers += L"X-HWID: " + wHwid + L"\r\n";
+                headers += OBF_W(L"X-HWID: ") + wHwid + OBF_W(L"\r\n");
             }
 
             BOOL bResults = WinHttpSendRequest(hRequest, headers.c_str(), -1, (LPVOID)postData.c_str(), (DWORD)postData.length(), (DWORD)postData.length(), 0);
@@ -100,7 +97,7 @@ namespace Api {
                 WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &dwStatusCode, &dwSize, WINHTTP_NO_HEADER_INDEX);
                 response.statusCode = dwStatusCode;
                 
-                std::cout << "[API] Request to " << path << " -> Status: " << dwStatusCode << "\n";
+                std::cout << OBF_S("[API] Request to ") << path << OBF_S(" -> Status: ") << dwStatusCode << "\n";
 
                 dwSize = 0;
                 DWORD dwDownloaded = 0;
@@ -108,7 +105,7 @@ namespace Api {
                 // Extract X-Allocation-Size header if present
                 wchar_t headerBuffer[256];
                 DWORD headerSize = sizeof(headerBuffer);
-                if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM, L"X-Allocation-Size", headerBuffer, &headerSize, WINHTTP_NO_HEADER_INDEX)) {
+                if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM, OBF_C(L"X-Allocation-Size"), headerBuffer, &headerSize, WINHTTP_NO_HEADER_INDEX)) {
                     response.allocationSizeHeader = _wtoi64(headerBuffer);
                 }
 
@@ -183,26 +180,36 @@ namespace Api {
     AuthResponse Login(const std::string& username, const std::string& password) {
         AuthResponse res;
         res.success = false;
-        
+
         std::string escapedUser = JsonEscape(username);
         std::string escapedPass = JsonEscape(password);
-        std::string jsonPayload = "{\"identifier\":\"" + escapedUser + "\",\"password\":\"" + escapedPass + "\"}";
-        
-        std::cout << "[API] Attempting login for: " << username << "...\n";
+        std::string jsonPayload = OBF_S("{\"identifier\":\"") + escapedUser
+                                + OBF_S("\",\"password\":\"") + escapedPass
+                                + OBF_S("\"}");
 
-        // Using /api/auth/login route (hypothetical, matches standard forum patterns)
-        HttpResponse resp = PerformRequest("POST", "/api/auth/login", jsonPayload);
-        
+        std::cout << OBF_S("[API] Attempting login for: ") << username << "...\n";
+
+        HttpResponse resp = PerformRequest(OBF_S("POST"), OBF_S("/api/auth/login"), jsonPayload);
+
         if (resp.success) {
-            std::string userObj = GetJsonValue(resp.body, "user");
+            std::string userObj = GetJsonValue(resp.body, OBF_S("user"));
             if (!userObj.empty()) {
                 res.success = true;
-                res.token = GetJsonValue(resp.body, "token");
-                res.message = "Login successful!";
-                res.avatarUrl = GetJsonValue(resp.body, "avatarUrl");
-                
-                // Parse activeProducts
-                std::string productsArray = GetJsonArray(resp.body, "activeProducts");
+                // The forum API uses Passport sessions and returns the
+                // session id at the top level as `sessionId`. The Express
+                // middleware in api-server/src/app.ts accepts that value
+                // as the `Authorization: Bearer <sid>` token for any
+                // subsequent loader / heartbeat call, so we treat it as
+                // our bearer token. Older server builds returned `token`
+                // instead, so fall back to that for backwards compat.
+                res.token = GetJsonValue(resp.body, OBF_S("sessionId"));
+                if (res.token.empty()) {
+                    res.token = GetJsonValue(resp.body, OBF_S("token"));
+                }
+                res.message = OBF_S("Login successful!");
+                res.avatarUrl = GetJsonValue(resp.body, OBF_S("avatarUrl"));
+
+                std::string productsArray = GetJsonArray(resp.body, OBF_S("activeProducts"));
                 if (!productsArray.empty()) {
                     size_t pos = 0;
                     while (true) {
@@ -212,11 +219,11 @@ namespace Api {
                         if (objEnd == std::string::npos) break;
 
                         std::string obj = productsArray.substr(objStart, objEnd - objStart + 1);
-                        
+
                         ProductAccess prod;
-                        prod.productId = GetJsonValue(obj, "productId");
-                        prod.expiresAt = GetJsonValue(obj, "expiresAt");
-                        prod.tier      = GetJsonValue(obj, "tier");
+                        prod.productId = GetJsonValue(obj, OBF_S("productId"));
+                        prod.expiresAt = GetJsonValue(obj, OBF_S("expiresAt"));
+                        prod.tier      = GetJsonValue(obj, OBF_S("tier"));
                         prod.hasAccess = true;
 
                         if (!prod.productId.empty()) {
@@ -225,20 +232,20 @@ namespace Api {
                         pos = objEnd + 1;
                     }
                 }
-                
-                std::cout << "[API] Logged in successfully. Found " << res.subscriptions.size() << " products.\n";
+
+                std::cout << OBF_S("[API] Logged in successfully. Found ") << res.subscriptions.size() << OBF_S(" products.\n");
             } else {
-                res.message = "Invalid response from server";
+                res.message = OBF_S("Invalid response from server");
             }
         } else {
             if (resp.statusCode == 401) {
-                res.message = "Invalid username or password.";
+                res.message = OBF_S("Invalid username or password.");
             } else if (resp.statusCode == 400) {
-                res.message = "Bad request (Invalid JSON format).";
+                res.message = OBF_S("Bad request (Invalid JSON format).");
             } else if (resp.statusCode == 404) {
-                res.message = "API endpoint not found.";
+                res.message = OBF_S("API endpoint not found.");
             } else {
-                res.message = "Could not connect to Scootware API server (Err: " + std::to_string(resp.statusCode) + ")";
+                res.message = OBF_S("Could not connect to Scootware API server (Err: ") + std::to_string(resp.statusCode) + ")";
             }
         }
 
@@ -354,7 +361,7 @@ namespace Api {
         BCryptCloseAlgorithmProvider(hAlg, 0);
 
         if (status != 0) {
-            std::cout << "[API] AES-GCM decryption failed (status 0x" << std::hex << status << std::dec << "). HWID mismatch or tampered data.\n";
+            std::cout << OBF_S("[API] AES-GCM decryption failed (status 0x") << std::hex << status << std::dec << OBF_S("). HWID mismatch or tampered data.\n");
             return {};
         }
         plaintext.resize(cbPlaintext);
@@ -364,28 +371,26 @@ namespace Api {
     // -----------------------------------------------------------------------
 
     std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token, const std::string& hwid) {
-        std::cout << "[API] Fetching encrypted stream for " << productId << " (" << assetType << ")...\n";
+        std::cout << OBF_S("[API] Fetching encrypted stream for ") << productId << " (" << assetType << ")...\n";
         s_lastStreamHwidMismatch = false;
 
-        std::string path = "/api/products/" + productId + "/assets/stream?type=" + assetType;
-        // Pass hwid so PerformRequest adds the X-HWID header
-        HttpResponse resp = PerformRequest("GET", path, "", token, hwid);
+        std::string path = OBF_S("/api/products/") + productId + OBF_S("/assets/stream?type=") + assetType;
+        HttpResponse resp = PerformRequest(OBF_S("GET"), path, "", token, hwid);
 
-        // Minimum valid encrypted payload: 12 (IV) + 1 (ciphertext) + 16 (tag)
         const size_t MIN_ENCRYPTED_LEN = 29;
 
         if (!resp.success) {
             if (resp.statusCode == 403) {
                 s_lastStreamHwidMismatch = true;
-                std::cout << "[API] HWID mismatch — this account is bound to a different machine.\n";
+                std::cout << OBF_S("[API] HWID mismatch.\n");
             } else {
-                std::cout << "[API] Stream request failed (status " << resp.statusCode << ").\n";
+                std::cout << OBF_S("[API] Stream request failed (status ") << resp.statusCode << ").\n";
             }
             return { {}, 0 };
         }
 
         if (resp.body.size() < MIN_ENCRYPTED_LEN) {
-            std::cout << "[API] Stream response too small to be valid encrypted data.\n";
+            std::cout << OBF_S("[API] Stream response too small to be valid encrypted data.\n");
             return { {}, 0 };
         }
 
@@ -402,7 +407,7 @@ namespace Api {
         SecureZeroMemory(secret.data(), secret.size());
 
         if (aesKey.empty()) {
-            std::cout << "[API] Failed to derive AES key.\n";
+            std::cout << OBF_S("[API] Failed to derive AES key.\n");
             return { {}, 0 };
         }
 
@@ -412,7 +417,7 @@ namespace Api {
         if (plaintext.empty())
             return { {}, 0 };
 
-        std::cout << "[API] Decrypted " << plaintext.size() << " bytes successfully.\n";
+        std::cout << OBF_S("[API] Decrypted ") << plaintext.size() << OBF_S(" bytes successfully.\n");
         return { plaintext, resp.allocationSizeHeader };
     }
 
@@ -426,23 +431,25 @@ namespace Api {
         std::string hwid = JsonEscape(newHwid);
 
         std::string payload =
-            "{\"newHwid\":\"" + hwid + "\","
-            "\"newHwidDetails\":{\"cpu\":\"" + cpu + "\",\"gpu\":\"" + gpu + "\",\"ramGb\":" + ram + "}}";
+            OBF_S("{\"newHwid\":\"") + hwid + OBF_S("\",")
+          + OBF_S("\"newHwidDetails\":{\"cpu\":\"") + cpu
+          + OBF_S("\",\"gpu\":\"") + gpu
+          + OBF_S("\",\"ramGb\":") + ram + OBF_S("}}");
 
-        HttpResponse resp = PerformRequest("POST", "/api/hwid-reset", payload, token);
+        HttpResponse resp = PerformRequest(OBF_S("POST"), OBF_S("/api/hwid-reset"), payload, token);
 
         if (resp.success) {
             res.success = true;
-            res.message = "Reset request submitted. An admin will review it shortly.";
+            res.message = OBF_S("Reset request submitted. An admin will review it shortly.");
         } else if (resp.statusCode == 409) {
             res.success = false;
-            res.message = "You already have a pending HWID reset request.";
+            res.message = OBF_S("You already have a pending HWID reset request.");
         } else if (resp.statusCode == 401) {
             res.success = false;
-            res.message = "Session expired. Please log in again.";
+            res.message = OBF_S("Session expired. Please log in again.");
         } else {
             res.success = false;
-            res.message = "Failed to submit reset request (Err: " + std::to_string(resp.statusCode) + ")";
+            res.message = OBF_S("Failed to submit reset request (Err: ") + std::to_string(resp.statusCode) + ")";
         }
         return res;
     }
@@ -458,23 +465,79 @@ namespace Api {
             details += triggers[i];
         }
 
-        std::string safeHwid    = JsonEscape(hwid.empty() ? "UNKNOWN" : hwid);
-        std::string safeDetails = JsonEscape(details.empty() ? "unknown" : details);
+        std::string safeHwid    = JsonEscape(hwid.empty() ? OBF_S("UNKNOWN") : hwid);
+        std::string safeDetails = JsonEscape(details.empty() ? OBF_S("unknown") : details);
 
-        std::string eventType = "detection";
-        if (vmDetected && debuggerDetected) eventType = "vm_and_debugger_detected";
-        else if (vmDetected)               eventType = "vm_detected";
-        else if (debuggerDetected)         eventType = "debugger_detected";
+        std::string eventType = OBF_S("detection");
+        if (vmDetected && debuggerDetected) eventType = OBF_S("vm_and_debugger_detected");
+        else if (vmDetected)               eventType = OBF_S("vm_detected");
+        else if (debuggerDetected)         eventType = OBF_S("debugger_detected");
 
         std::string payload =
-            "{\"hwid\":\"" + safeHwid + "\","
-            "\"vmDetected\":" + (vmDetected ? "true" : "false") + ","
-            "\"debuggerDetected\":" + (debuggerDetected ? "true" : "false") + ","
-            "\"eventType\":\"" + eventType + "\","
-            "\"details\":\"" + safeDetails + "\"}";
+            OBF_S("{\"hwid\":\"") + safeHwid + OBF_S("\",")
+          + OBF_S("\"vmDetected\":") + (vmDetected ? OBF_S("true") : OBF_S("false")) + OBF_S(",")
+          + OBF_S("\"debuggerDetected\":") + (debuggerDetected ? OBF_S("true") : OBF_S("false")) + OBF_S(",")
+          + OBF_S("\"eventType\":\"") + eventType + OBF_S("\",")
+          + OBF_S("\"details\":\"") + safeDetails + OBF_S("\"}");
 
         // Best-effort: fire and forget. No token needed — unauthenticated endpoint
         // exists specifically for pre-login loader reporting.
-        PerformRequest("POST", "/api/auth/loader-event", payload);
+        PerformRequest(OBF_S("POST"), OBF_S("/api/auth/loader-event"), payload);
+    }
+
+    HeartbeatResponse Heartbeat(const std::string& token,
+                                const std::string& hwid,
+                                const std::string& productId)
+    {
+        HeartbeatResponse r{ false, 0, "" };
+
+        // Anti-replay: server enforces |now - ts| < 30s and (userId, nonce)
+        // uniqueness over a 5-min window. Both fields are mandatory.
+        uint64_t nowMs = (uint64_t)GetTickCount64();
+        uint64_t nonce = ((uint64_t)GetCurrentProcessId() << 32) ^ nowMs;
+
+        std::string payload =
+            OBF_S("{\"hwid\":\"")     + JsonEscape(hwid)      + OBF_S("\",")
+          + OBF_S("\"productId\":\"") + JsonEscape(productId) + OBF_S("\",")
+          + OBF_S("\"uptimeMs\":")    + std::to_string(nowMs) + OBF_S(",")
+          + OBF_S("\"nonce\":")       + std::to_string(nonce) + OBF_S(",")
+          + OBF_S("\"ts\":")          + std::to_string(nowMs) + OBF_S("}");
+
+        HttpResponse resp = PerformRequest(
+            OBF_S("POST"), OBF_S("/api/auth/heartbeat"), payload, token, hwid);
+
+        r.statusCode = resp.statusCode;
+        if (resp.success) {
+            std::string ok = GetJsonValue(resp.body, OBF_S("ok"));
+            r.success = (ok == "true" || resp.statusCode == 200);
+            r.reason  = GetJsonValue(resp.body, OBF_S("reason"));
+        } else {
+            r.reason = GetJsonValue(resp.body, OBF_S("reason"));
+        }
+        return r;
+    }
+
+    void ReportLoaderEvent(const std::string& eventType,
+                           const std::string& productId,
+                           const std::string& hwid,
+                           const std::string& details,
+                           const std::string& token)
+    {
+        std::string safeHwid    = JsonEscape(hwid.empty()    ? OBF_S("UNKNOWN") : hwid);
+        std::string safeProduct = JsonEscape(productId);
+        std::string safeDetails = JsonEscape(details);
+        std::string safeType    = JsonEscape(eventType);
+
+        std::string payload =
+            OBF_S("{\"hwid\":\"") + safeHwid + OBF_S("\",")
+          + OBF_S("\"vmDetected\":false,")
+          + OBF_S("\"debuggerDetected\":false,")
+          + OBF_S("\"eventType\":\"") + safeType + OBF_S("\",")
+          + OBF_S("\"productId\":\"") + safeProduct + OBF_S("\",")
+          + OBF_S("\"details\":\"") + safeDetails + OBF_S("\"}");
+
+        // Fire-and-forget; token is optional and passed through when present so
+        // the backend can attribute the event to the authenticated user.
+        PerformRequest(OBF_S("POST"), OBF_S("/api/auth/loader-event"), payload, token);
     }
 }

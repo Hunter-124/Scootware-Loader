@@ -1,4 +1,5 @@
 #include "session.h"
+#include "../security/obf.h"
 #include <windows.h>
 #include <wincrypt.h>
 #include <shlobj.h>
@@ -18,24 +19,29 @@ namespace Session {
         if (SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, NULL, &path) == S_OK) {
             fs::path appData(path);
             CoTaskMemFree(path);
-            fs::path scootwareDir = appData / "Scootware";
+            fs::path scootwareDir = appData / OBF_S("Scootware");
             if (!fs::exists(scootwareDir)) {
                 fs::create_directories(scootwareDir);
             }
-            return scootwareDir / "session.dat";
+            return scootwareDir / OBF_S("session.dat");
         }
         return "";
     }
 
     bool SaveCredentials(const std::string& username, const std::string& password) {
         std::string data = username + ":" + password;
-        
+
         DATA_BLOB input;
         input.pbData = (BYTE*)data.c_str();
         input.cbData = (DWORD)data.length();
 
+        // The DPAPI description string must persist for the duration of the call —
+        // CryptProtectData reads it via pointer. Bind the decrypted wstring to a
+        // local first so it outlives the WinAPI call.
+        std::wstring desc = OBF_W(L"ScootwareSession");
+
         DATA_BLOB output;
-        if (CryptProtectData(&input, L"ScootwareSession", NULL, NULL, NULL, 0, &output)) {
+        if (CryptProtectData(&input, desc.c_str(), NULL, NULL, NULL, 0, &output)) {
             fs::path filePath = GetSessionFilePath();
             if (filePath.empty()) return false;
 
