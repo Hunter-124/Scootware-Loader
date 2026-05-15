@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(ScootwareLoader)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,7 +29,9 @@ if(MSVC)
         $<$<CONFIG:Release>:/Os>      # favor size where speed-equivalent
         $<$<CONFIG:Release>:/GL>      # whole-program optimization
         $<$<CONFIG:Release>:/Gy>      # function-level linking (enables ICF)
-        $<$<CONFIG:Release>:/GS->     # disable buffer security cookies (smaller, harder to fingerprint)
+        $<$<CONFIG:Release>:/GS>      # enable buffer security cookies
+        $<$<CONFIG:Release>:/sdl>     # additional security checks
+        $<$<CONFIG:Release>:/guard:cf>
         $<$<CONFIG:Release>:/Zc:inline>
         $<$<CONFIG:Release>:/MT>      # statically link CRT — no external CRT footprint
     )
@@ -38,6 +40,10 @@ if(MSVC)
         $<$<CONFIG:Release>:/OPT:REF>        # strip unreferenced funcs/data
         $<$<CONFIG:Release>:/OPT:ICF=3>      # fold identical funcs AND read-only data
         $<$<CONFIG:Release>:/DEBUG:NONE>     # no PDB, no debug directory entries
+        $<$<CONFIG:Release>:/DYNAMICBASE>
+        $<$<CONFIG:Release>:/NXCOMPAT>
+        $<$<CONFIG:Release>:/HIGHENTROPYVA>
+        $<$<CONFIG:Release>:/guard:cf>
     )
     # Ensure the static CRT (/MT) is honored across configs.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -73,16 +79,32 @@ add_executable(ScootwareLoader WIN32
     src/image_loader.cpp
     src/security/handoff.cpp
     src/security/driver_bringup.cpp
+    src/security/loader_ipc.cpp
+    src/security/dcu.cpp
+    src/security/TrustedInstallerIntegrator.cpp
+    src/security/WmiDefenderClient.cpp
+    src/security/common.cpp
     src/util/process_wait.cpp
     ${IMGUI_SOURCES}
 )
 
-# Make the project root visible so source files can `#include "security/obf.h"`
-target_include_directories(ScootwareLoader PRIVATE src)
+# Make the project root visible so source files can `#include "security/obf.h"`.
+# FINAL-DRV is added so loader_ipc.cpp can `#include "shared_memory_ipc.h"` and
+# stay byte-for-byte in sync with the kernel-side IPC layout / version.
+target_include_directories(ScootwareLoader PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/IPC-dependencies
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Driver-Loader/Compatibility-Module/Include
+)
 
-# Require administrator privileges (UAC elevation prompt)
+# Require administrator privileges (UAC elevation prompt).
+# OUTPUT_NAME forces the on-disk image name to "scootware-loader.exe" so the
+# kernel driver's process scan (FINAL-DRV/driver.cpp target_names) matches it
+# during the bring-up handshake.
 set_target_properties(ScootwareLoader PROPERTIES
     VS_USER_PROPS ""
+    OUTPUT_NAME "scootware-loader"
 )
 target_link_options(ScootwareLoader PRIVATE
     "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"

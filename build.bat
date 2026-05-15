@@ -1,15 +1,28 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-echo ==========================================
-echo       Building Scootware Loader           
-echo ==========================================
-echo.
+call "%~dp0..\build\lib\env.bat"
+if errorlevel 1 (
+    if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+    exit /b 1
+)
 
-:: Normalize source dir to match CMAKE_HOME_DIRECTORY in CMakeCache (forward slashes, no trailing slash)
-set "SRCDIR=%~dp0"
-if "%SRCDIR:~-1%"=="\" set "SRCDIR=%SRCDIR:~0,-1%"
+call :run_build
+set "ERR=!ERRORLEVEL!"
+echo.
+if not "%ERR%"=="0" (
+    echo [-] Build failed ^(exit code %ERR%^).
+) else (
+    echo [+] Build finished OK.
+    echo     Staged: %BIN%\scootware.exe, %BIN%\scootware-loader.exe
+)
+if not "%ERR%"=="0" if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+exit /b %ERR%
+
+:run_build
+setlocal EnableExtensions EnableDelayedExpansion
+set "SRCDIR=%CD%"
 set "SRCDIR=%SRCDIR:\=/%"
 
 if exist "build\CMakeCache.txt" (
@@ -23,27 +36,57 @@ if exist "build\CMakeCache.txt" (
 
 if not exist "build" mkdir "build"
 
+echo ==========================================
+echo       Building Scootware Loader
+echo ==========================================
+echo.
+
 echo [*] Generating CMake build files...
 cmake -S . -B build
-if %errorlevel% neq 0 (
+if errorlevel 1 (
     echo.
-    echo [-] CMake generation failed! Ensure CMake is installed.
-    pause
-    exit /b %errorlevel%
+    echo [-] CMake generation failed! Ensure CMake is installed and on PATH.
+    endlocal & exit /b 1
 )
 
 echo.
-echo [*] Compiling project...
-cmake --build build --config Release
-if %errorlevel% neq 0 (
+echo [*] Compiling ScootwareLoader...
+cmake --build build --config Release --target ScootwareLoader
+if errorlevel 1 (
     echo.
-    echo [-] Compilation failed!
-    pause
-    exit /b %errorlevel%
+    echo [-] ScootwareLoader build failed!
+    endlocal & exit /b 1
 )
 
 echo.
-echo [+] Build successful! Executable is located in build\Release
-pause
-endlocal
-exit /b 0
+echo [*] Compiling hollow host - scootware.exe - RunPE / driver probe shell ...
+cmake --build build --config Release --target ScootwareHost
+if errorlevel 1 (
+    echo.
+    echo [-] ScootwareHost ^(scootware.exe^) build failed!
+    endlocal & exit /b 1
+)
+
+if not exist "build\Release\scootware.exe" (
+    echo.
+    echo [-] Expected output missing: build\Release\scootware.exe
+    echo     RunPE and driver bringup look for this file next to the loader.
+    endlocal & exit /b 1
+)
+
+echo.
+robocopy "%CD%\build\Release" "%BIN%" scootware.exe /NFL /NDL /NJH /NJS /nc /ns /np >nul
+if errorlevel 8 (
+    echo [-] robocopy failed copying scootware.exe to BIN.
+    endlocal & exit /b 1
+)
+robocopy "%CD%\build\Release" "%BIN%" scootware-loader.exe /NFL /NDL /NJH /NJS /nc /ns /np >nul
+if errorlevel 8 (
+    echo [-] robocopy failed copying scootware-loader.exe to BIN.
+    endlocal & exit /b 1
+)
+
+echo [+] Build successful!
+echo     Loader:  build\Release\scootware-loader.exe
+echo     Hollow:  build\Release\scootware.exe
+endlocal & exit /b 0
