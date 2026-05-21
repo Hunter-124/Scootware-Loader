@@ -34,28 +34,25 @@
 // and the loader's image name is `ScootwareLoader.exe` — its IPC magic
 // would never be found.
 //
-// To work around that without giving up the "is one already loaded?"
-// check, we use the SAME hollow_exe binary as a probe. It's already
-// named `scootware.exe` (CMake OUTPUT_NAME), it's already going to be
-// staged on disk for the mapper hollow, and host.cpp has a `--sw-probe-
-// driver` mode that does PING + optional SHUTDOWN over a tiny IPC stub
-// and reports the result via process exit code. See
-// Website/Loader/src/host/host_probe_protocol.h for the protocol.
+// We used to spawn a separate scootware.exe probe to do that check via
+// the host.cpp `--sw-probe-driver` mode. That codepath is gone — the
+// loader image is now itself a recognized IPC target (see
+// FINAL-DRV/driver.cpp target_names + CMake OUTPUT_NAME), so the loader
+// can ping/shutdown the existing driver in-process via LoaderIpc::Ping /
+// LoaderIpc::RequestShutdown BEFORE calling Run(). That collapses the
+// double-spawn (probe scootware.exe + mapper scootware.exe) into a
+// single scootware.exe (the mapper) per bring-up.
 //
-// With the probe in place the bring-up flow is:
+// Run() therefore is now strictly the "stream + hollow + wait" stage:
 //
 //   1. stage hollow_exe to %TEMP%
-//   2. spawn host.exe with --sw-probe-driver --sw-shutdown-existing,
-//      wait for it to exit
-//   3. interpret exit code:
-//        - NO_DRIVER         -> map a fresh one
-//        - DRIVER_SHUTDOWN   -> sleep briefly for the kernel to fully
-//                               unload, then map a fresh one
-//        - DRIVER_ALIVE      -> existing driver refused to leave; bail
-//                               with ProbeFailedDriverStuck rather than
-//                               attempt a double-load
-//   4. (if mapping) stream driver_loader, hollow it into the staged host
-//   5. cleanup
+//   2. stream driver_loader from the API
+//   3. hollow it into the staged host and wait for clean exit
+//   4. cleanup
+//
+// The caller is responsible for the "should I map at all?" decision —
+// see main.cpp where it pings via LoaderIpc and skips the call entirely
+// if a healthy driver is already attached.
 //
 
 #include <string>
@@ -65,13 +62,12 @@
 namespace DriverBringup {
 
     enum class Result {
-        Success,                // mapper ran cleanly (with or without a prior SHUTDOWN of an existing driver)
-        AlreadyUp,              // probe found a working driver and SkipIfAlreadyMapped was set, so we never invoked the mapper
+        Success,                // mapper ran cleanly
+        AlreadyUp,              // retained for ABI symmetry with caller switch — Run() itself never returns this; caller short-circuits via LoaderIpc::Ping
         StreamFailed,           // /api/products/.../assets/stream returned nothing
         HostMissing,            // could not stage hollow_exe to %TEMP% (also: no hollowExeBuffer supplied)
         HollowFailed,           // RunPE::Execute returned false
         MapperReportedFailure,  // mapper exited with non-zero code or hung past the timeout
-        ProbeFailedDriverStuck, // probe detected an existing driver but it refused SHUTDOWN, so we declined to map a second one on top of it
     };
 
     struct Outcome {
@@ -79,6 +75,32 @@ namespace DriverBringup {
         // Human-readable summary suitable for Api::ReportLoaderEvent and
         // for the loader status pill. Always populated, even on success.
         std::string details;
+    };
+
+    // Mapper configuration — controls which KDU provider, shellcode version,
+    // and DSE behaviour the hollowed mapper uses.  Pass default-initialised
+    // (zero / empty) for the baked defaults (auto-detect provider, SC V2,
+    // DSE mandatory).
+    struct MapperConfig {
+        // Provider public id (1..KDU_PUBLIC_ID_MAX).  0 = auto-detect first
+        // compatible provider on the target system.
+        int providerPublicId = 0;
+
+        // Shellcode version (1 = KiBUGCHECK, 2 = ExQueueWorkItem, 3 = ObCreateObject).
+        // 0 = use mapper's compile-time default (currently V3).
+        int shellCodeVersion = 0;
+
+        // TRUE (default) — abort the whole mapping sequence if DSE disable
+        // fails.  FALSE — log a warning and try the map anyway.
+        bool requireDseSuccess = true;
+
+        // Driver object name (required for shellcode V3).  Pass empty string
+        // for shellcode V1/V2 (ignored by the mapper).
+        std::string driverObjectName;
+
+        // Driver registry key name (optional, shellcode V3 only).  When empty
+        // the mapper uses driverObjectName as the registry path fallback.
+        std::string driverRegistryPath;
     };
 
     // Pull the latest `driver_loader` asset for `productId` from the API,
@@ -93,6 +115,10 @@ namespace DriverBringup {
     // ShellExecute (which would lose the stealth benefit and re-introduce
     // the visible DriverLoader.exe name in the task list).
     //
+    // mapperCfg controls which vulnerable-driver provider the mapper uses,
+    // which shellcode version, and whether DSE failure is fatal.  Leave
+    // default-initialised for baked defaults.
+    //
     // Returns once the mapper has exited (success path) or once we've
     // given up on it (failure path). Does NOT spin a PING-poll — that's
     // the cheat's job after it's hollowed.
@@ -100,5 +126,6 @@ namespace DriverBringup {
                 const std::string& token,
                 const std::string& hwid,
                 const std::vector<uint8_t>& hollowExeBuffer,
-                size_t hollowAllocSize);
+                size_t hollowAllocSize,
+                const MapperConfig& mapperCfg = {});
 }

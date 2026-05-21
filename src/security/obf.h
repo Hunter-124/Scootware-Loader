@@ -37,13 +37,17 @@
 // std::string — decrypted copy returned by value (safe to store).
 #define OBF_S(str) ([&]() -> std::string { \
     auto _enc = skCrypt(str);              \
-    return std::string(_enc.decrypt());    \
+    std::string _out(_enc.decrypt());      \
+    _enc.clear();                          \
+    return _out;                           \
 }())
 
 // std::wstring — decrypted copy returned by value (safe to store).
 #define OBF_W(str) ([&]() -> std::wstring { \
     auto _enc = skCrypt(str);               \
-    return std::wstring(_enc.decrypt());    \
+    std::wstring _out(_enc.decrypt());      \
+    _enc.clear();                           \
+    return _out;                            \
 }())
 
 // Raw const char* — pointer is valid ONLY for the lifetime of the

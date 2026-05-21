@@ -240,7 +240,23 @@ namespace ImageLoader {
             }
 
             std::vector<uint8_t> bytes;
-            if (!HttpGet(job.path, bytes)) continue;
+            if (job.path.rfind("file://", 0) == 0) {
+                std::string localPath = job.path.substr(7);
+                FILE* f = nullptr;
+                fopen_s(&f, localPath.c_str(), "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    size_t sz = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    bytes.resize(sz);
+                    fread(bytes.data(), 1, sz, f);
+                    fclose(f);
+                } else {
+                    continue; // File not found or inaccessible
+                }
+            } else if (!HttpGet(job.path, bytes)) {
+                continue;
+            }
 
             DecodedImage img;
             img.key = job.key;

@@ -268,10 +268,10 @@ static bool ResolveImports(HANDLE hProcess, LPVOID pRemoteImage,
   return true;
 }
 
-bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
-             const std::string &customHostPath,
-             const std::vector<char> &childEnvironment,
-             const Options &opts) {
+Result Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
+              const std::string &customHostPath,
+              const std::vector<char> &childEnvironment,
+              const Options &opts) {
   ::LoaderDiag::Banner("scootware-loader RunPE::Execute");
   const char *waitModeName =
       (opts.waitMode == WaitMode::ExpectCleanExit) ? "ExpectCleanExit"
@@ -287,7 +287,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
   if (memoryBuffer.size() < sizeof(IMAGE_DOS_HEADER)) {
     LDIAG_LINE("[RunPE] FAILED: buffer too small for DOS header");
     std::cout << "[-] Buffer too small for DOS header\n";
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   // If the caller handed us an explicit env block, use it. Otherwise pass
@@ -305,26 +305,33 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
 
   PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)memoryBuffer.data();
   if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-    std::cout << "[-] Invalid DOS signature\n";
-    return false;
+    LDIAG() << "[RunPE] FAILED: invalid DOS signature — first two bytes are 0x"
+            << std::hex << pDosHeader->e_magic
+            << " (expected 0x5A4D). Server probably has a non-PE binary "
+               "uploaded as primary_exe.";
+    return Result{ false, 0, nullptr };
   }
 
   if ((size_t)pDosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS64) >
       memoryBuffer.size()) {
-    std::cout << "[-] Invalid e_lfanew offset\n";
-    return false;
+    LDIAG() << "[RunPE] FAILED: e_lfanew=0x" << std::hex << pDosHeader->e_lfanew
+            << " extends past buffer (" << std::dec << memoryBuffer.size() << " bytes)";
+    return Result{ false, 0, nullptr };
   }
 
   PIMAGE_NT_HEADERS64 pNtHeaders =
       (PIMAGE_NT_HEADERS64)(memoryBuffer.data() + pDosHeader->e_lfanew);
   if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
-    std::cout << "[-] Invalid NT signature\n";
-    return false;
+    LDIAG() << "[RunPE] FAILED: invalid NT signature 0x" << std::hex
+            << pNtHeaders->Signature << " (expected 0x00004550)";
+    return Result{ false, 0, nullptr };
   }
 
   if (pNtHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-    std::cout << "[-] Not a 64-bit PE\n";
-    return false;
+    LDIAG() << "[RunPE] FAILED: wrong machine type 0x" << std::hex
+            << pNtHeaders->FileHeader.Machine
+            << " (expected 0x8664 = AMD64). 32-bit binary uploaded as primary_exe?";
+    return Result{ false, 0, nullptr };
   }
 
   // scootware.exe is a console-subsystem host so GetStdHandle works natively
@@ -354,7 +361,11 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     }
   }
   std::string commandLine = "\"" + hostPath + "\"";
-  std::cout << "[RunPE] Spawning host: " << hostPath << "\n";
+  if (!opts.commandArgs.empty()) {
+      commandLine += " " + opts.commandArgs;
+  }
+  std::cout << "[RunPE] Spawning host: " << hostPath
+            << " args: " << opts.commandArgs << "\n";
 
   // Determine correct working directory for payload
   // Payload expects scripts in %APPDATA%\scootware\scripts
@@ -486,7 +497,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       if (hNulStdErr != INVALID_HANDLE_VALUE) CloseHandle(hNulStdErr);
       DeleteProcThreadAttributeList(siex.lpAttributeList);
       HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
-      return false;
+      return Result{ false, 0, nullptr };
     } else {
       LDIAG() << "[RunPE] Fallback CreateProcessA OK pid=" << pi.dwProcessId;
       if (!customHostPath.empty()) {
@@ -521,7 +532,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   // Get PEB address via NtQueryInformationProcess
@@ -542,7 +553,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       TerminateProcess(pi.hProcess, 0);
       CloseHandle(pi.hProcess);
       CloseHandle(pi.hThread);
-      return false;
+      return Result{ false, 0, nullptr };
     }
   }
   std::cout << "[RunPE] PEB base from NtQueryInformationProcess: 0x" << std::hex
@@ -661,7 +672,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   std::cout << "[RunPE] Allocated at 0x" << std::hex << (ULONGLONG)pRemoteImage
@@ -700,38 +711,48 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   // Write each section
   PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
   for (int i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++) {
-    if (pSectionHeader[i].SizeOfRawData == 0)
-      continue; // BSS etc
-
     LPVOID pDest =
         (LPVOID)((uintptr_t)pRemoteImage + pSectionHeader[i].VirtualAddress);
-    const void *pSrc = memoryBuffer.data() + pSectionHeader[i].PointerToRawData;
 
-    // Bounds check
-    if (pSectionHeader[i].PointerToRawData + pSectionHeader[i].SizeOfRawData >
-        memoryBuffer.size()) {
-      std::cout << "[-] Section " << pSectionHeader[i].Name
-                << " exceeds buffer\n";
-      TerminateProcess(pi.hProcess, 0);
-      CloseHandle(pi.hProcess);
-      CloseHandle(pi.hThread);
-      return false;
+    DWORD rawSize = pSectionHeader[i].SizeOfRawData;
+    DWORD virtSize = pSectionHeader[i].Misc.VirtualSize;
+    if (virtSize == 0) virtSize = rawSize;
+
+    if (rawSize > 0) {
+      const void *pSrc = memoryBuffer.data() + pSectionHeader[i].PointerToRawData;
+      
+      // Bounds check
+      if (pSectionHeader[i].PointerToRawData + rawSize > memoryBuffer.size()) {
+        std::cout << "[-] Section " << std::string((char *)pSectionHeader[i].Name, 8) << " exceeds buffer\n";
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return Result{ false, 0, nullptr };
+      }
+
+      if (!WriteProcessMemory(pi.hProcess, pDest, pSrc, rawSize, NULL)) {
+        std::cout << "[-] Failed to write section: " << std::string((char *)pSectionHeader[i].Name, 8) << "\n";
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return Result{ false, 0, nullptr };
+      }
     }
 
-    if (!WriteProcessMemory(pi.hProcess, pDest, pSrc,
-                            pSectionHeader[i].SizeOfRawData, NULL)) {
-      std::cout << "[-] Failed to write section: " << pSectionHeader[i].Name
-                << "\n";
-      TerminateProcess(pi.hProcess, 0);
-      CloseHandle(pi.hProcess);
-      CloseHandle(pi.hThread);
-      return false;
+    // Force backing of the uninitialized part of the section so physical memory
+    // scanners (like our kernel driver) can find the pages before the child
+    // process touches them. VirtualAllocEx only commits (demand-zero); we must write.
+    if (virtSize > rawSize) {
+      DWORD diff = virtSize - rawSize;
+      LPVOID pBssDest = (LPVOID)((uintptr_t)pDest + rawSize);
+      std::vector<uint8_t> zeros(diff, 0);
+      WriteProcessMemory(pi.hProcess, pBssDest, zeros.data(), diff, NULL);
     }
   }
 
@@ -747,7 +768,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       TerminateProcess(pi.hProcess, 0);
       CloseHandle(pi.hProcess);
       CloseHandle(pi.hThread);
-      return false;
+      return Result{ false, 0, nullptr };
     }
   }
 
@@ -762,7 +783,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   // Now that the process is initialized, update PEB->ImageBaseAddress to point
@@ -774,7 +795,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   // -----------------------------------------------------------------------
@@ -1031,9 +1052,10 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
         opts.cleanExitDiag->timedOut = true;
       }
       TerminateProcess(pi.hProcess, 1);
+      WaitForSingleObject(pi.hProcess, 5000);
       CloseHandle(pi.hProcess);
       CloseHandle(pi.hThread);
-      return false;
+      return Result{ false, 0, nullptr };
     }
 
     DWORD exitCode = 0;
@@ -1049,7 +1071,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
       }
       CloseHandle(pi.hProcess);
       CloseHandle(pi.hThread);
-      return false;
+      return Result{ false, 0, nullptr };
     }
 
     LDIAG() << "[RunPE] Mapper pid=" << pi.dwProcessId
@@ -1057,7 +1079,8 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
     std::cout << "[RunPE] Mapper exited cleanly — bring-up considered done\n";
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return true;
+    // ExpectCleanExit: pid/base not meaningful for the mapper caller.
+    return Result{true, pi.dwProcessId, pRemoteImage};
   }
 
   // ExpectAlive (default): historical cheat-host semantics.
@@ -1083,7 +1106,7 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return false;
+    return Result{ false, 0, nullptr };
   }
 
   LDIAG() << "[RunPE] Child pid=" << pi.dwProcessId
@@ -1091,9 +1114,12 @@ bool Execute(const std::vector<uint8_t> &memoryBuffer, size_t allocationSize,
           << "ms — injection considered successful";
   std::cout << "[RunPE] Child process alive after wait — injection successful\n";
 
+  DWORD cheat_pid   = pi.dwProcessId;
+  LPVOID cheat_base = pRemoteImage;
+
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
 
-  return true;
+  return Result{true, cheat_pid, cheat_base};
 }
 } // namespace RunPE

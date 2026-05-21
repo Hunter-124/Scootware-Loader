@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <mutex>
 #include <sstream>
+#include "../security/obf.h"
 
 namespace LoaderDiag {
 
@@ -38,29 +39,29 @@ namespace LoaderDiag {
         char temp[MAX_PATH] = {};
         DWORD n = ::GetTempPathA(MAX_PATH, temp);
         if (n == 0 || n > MAX_PATH) {
-            cache = "scootware-diag.log";
+            cache = OBF_S("scootware-diag.log");
             return cache.c_str();
         }
         cache.assign(temp, n);
         if (cache.back() != '\\' && cache.back() != '/') cache += '\\';
-        cache += "scootware-diag.log";
+        cache += OBF_S("scootware-diag.log");
         return cache.c_str();
     }
 
     inline void WriteLine(std::string_view line) {
         std::lock_guard<std::mutex> lock(Mutex());
 
-        ::OutputDebugStringA("[scootware-loader] ");
+        ::OutputDebugStringA(OBF_A("[scootware-loader] "));
         std::string nul_terminated{ line };
         ::OutputDebugStringA(nul_terminated.c_str());
-        ::OutputDebugStringA("\n");
+        ::OutputDebugStringA(OBF_A("\n"));
 
         FILE* f = nullptr;
-        if (fopen_s(&f, FilePath(), "ab") != 0 || !f) return;
+        if (fopen_s(&f, FilePath(), OBF_A("ab")) != 0 || !f) return;
 
         SYSTEMTIME st{};
         ::GetLocalTime(&st);
-        std::fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u  loader-pid=%lu  tid=%lu  %.*s\n",
+        std::fprintf(f, OBF_A("%04u-%02u-%02u %02u:%02u:%02u.%03u  loader-pid=%lu  tid=%lu  %.*s\n"),
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
             ::GetCurrentProcessId(), ::GetCurrentThreadId(),
             static_cast<int>(line.size()), line.data());
@@ -82,16 +83,16 @@ namespace LoaderDiag {
     inline void Banner(const char* tag) {
         std::lock_guard<std::mutex> lock(Mutex());
         FILE* f = nullptr;
-        if (fopen_s(&f, FilePath(), "ab") != 0 || !f) return;
+        if (fopen_s(&f, FilePath(), OBF_A("ab")) != 0 || !f) return;
         SYSTEMTIME st{};
         ::GetLocalTime(&st);
         std::fprintf(f,
-            "\n"
+            OBF_A("\n"
             "==========================================================\n"
             " %04u-%02u-%02u %02u:%02u:%02u.%03u  %s  pid=%lu\n"
-            "==========================================================\n",
+            "==========================================================\n"),
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            tag ? tag : "scootware-loader",
+            tag ? tag : OBF_A("scootware-loader"),
             ::GetCurrentProcessId());
         std::fclose(f);
     }

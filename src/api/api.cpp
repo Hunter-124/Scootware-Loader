@@ -1,5 +1,7 @@
 #include "api.h"
 #include "../security/obf.h"
+#include "../security/driver_bringup.h"
+#include "../util/diaglog.h"
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -16,8 +18,14 @@ namespace Api {
 
     // Set when StreamAsset receives HTTP 403 (HWID mismatch).
     static bool s_lastStreamHwidMismatch = false;
+    // Last HTTP status code from StreamAsset (0 if network error).
+    static DWORD s_lastStreamStatusCode = 0;
+    // Last response body from StreamAsset error (for server-side error messages).
+    static std::string s_lastStreamErrorBody;
 
     bool LastStreamWasHwidMismatch() { return s_lastStreamHwidMismatch; }
+    DWORD LastStreamStatusCode() { return s_lastStreamStatusCode; }
+    const std::string& LastStreamErrorBody() { return s_lastStreamErrorBody; }
 
     // Simple helper to perform a WinHttp request
     struct HttpResponse {
@@ -58,38 +66,64 @@ namespace Api {
         return output;
     }
 
+// UTF-8 → UTF-16 conversion.  The range-based wstring constructor
+// zero-extends each char, which corrupts any non-ASCII character in
+// paths, tokens, or HWIDs that happen to contain bytes > 0x7F.
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int need = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (need <= 0) return {};
+    std::wstring out((size_t)need, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], need);
+    return out;
+}
+
     HttpResponse PerformRequest(const std::string& method, const std::string& path, const std::string& postData = "", const std::string& token = "", const std::string& hwid = "") {
         HttpResponse response = { false, "", 0, 0 };
         ApiSettings settings = GetSettings();
         
         HINTERNET hSession = WinHttpOpen(OBF_C(L"ScootwareLoader/1.0"), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) return response;
+        if (!hSession) {
+            LDIAG() << "[api] PerformRequest: WinHttpOpen failed";
+            return response;
+        }
 
         HINTERNET hConnect = WinHttpConnect(hSession, settings.host.c_str(), settings.port, 0);
         if (!hConnect) {
+            LDIAG() << "[api] PerformRequest: WinHttpConnect failed port=" << settings.port;
             WinHttpCloseHandle(hSession);
             return response;
         }
 
-        std::wstring wPath(path.begin(), path.end());
-        std::wstring wMethod(method.begin(), method.end());
+        std::wstring wPath   = Utf8ToWide(path);
+        std::wstring wMethod = Utf8ToWide(method);
 
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, wMethod.c_str(), wPath.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, (settings.secure ? WINHTTP_FLAG_SECURE : 0));
         
         if (hRequest) {
             std::wstring headers = OBF_W(L"Content-Type: application/json\r\n");
             if (!token.empty()) {
-                std::wstring wToken(token.begin(), token.end());
+                std::wstring wToken = Utf8ToWide(token);
                 headers += OBF_W(L"Authorization: Bearer ") + wToken + OBF_W(L"\r\n");
             }
             if (!hwid.empty()) {
-                std::wstring wHwid(hwid.begin(), hwid.end());
+                std::wstring wHwid = Utf8ToWide(hwid);
                 headers += OBF_W(L"X-HWID: ") + wHwid + OBF_W(L"\r\n");
             }
 
             BOOL bResults = WinHttpSendRequest(hRequest, headers.c_str(), -1, (LPVOID)postData.c_str(), (DWORD)postData.length(), (DWORD)postData.length(), 0);
             
+            if (!bResults) {
+                DWORD err = ::GetLastError();
+                LDIAG() << "[api] PerformRequest: WinHttpSendRequest failed err=" << err << " path=" << path;
+            }
+
             if (bResults) bResults = WinHttpReceiveResponse(hRequest, NULL);
+
+            if (!bResults && response.statusCode == 0) {
+                DWORD err = ::GetLastError();
+                LDIAG() << "[api] PerformRequest: WinHttpReceiveResponse failed err=" << err << " path=" << path;
+            }
 
             if (bResults) {
                 DWORD dwStatusCode = 0;
@@ -97,6 +131,7 @@ namespace Api {
                 WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &dwStatusCode, &dwSize, WINHTTP_NO_HEADER_INDEX);
                 response.statusCode = dwStatusCode;
                 
+                LDIAG() << "[api] " << method << " " << path << " -> " << dwStatusCode;
                 std::cout << OBF_S("[API] Request to ") << path << OBF_S(" -> Status: ") << dwStatusCode << "\n";
 
                 dwSize = 0;
@@ -141,12 +176,19 @@ namespace Api {
         pos = json.find(":", pos);
         if (pos == std::string::npos) return "";
         
+        size_t nextComma = json.find(",", pos);
+        size_t nextBrace = json.find("}", pos);
+        size_t endBoundary = json.length();
+        if (nextComma != std::string::npos) endBoundary = (std::min)(endBoundary, nextComma);
+        if (nextBrace != std::string::npos) endBoundary = (std::min)(endBoundary, nextBrace);
+
         size_t start = json.find("\"", pos);
-        if (start == std::string::npos) {
+        if (start == std::string::npos || start > endBoundary) {
             // Might be a boolean or number
-            size_t valStart = json.find_first_not_of(": ", pos + 1);
-            size_t valEnd = json.find_first_of(",}", valStart);
-            if (valStart == std::string::npos || valEnd == std::string::npos) return "";
+            size_t valStart = json.find_first_not_of(": \t\r\n", pos + 1);
+            size_t valEnd = json.find_first_of(",} \t\r\n", valStart);
+            if (valStart == std::string::npos) return "";
+            if (valEnd == std::string::npos) valEnd = json.length();
             return json.substr(valStart, valEnd - valStart);
         }
         
@@ -371,8 +413,11 @@ namespace Api {
     // -----------------------------------------------------------------------
 
     std::pair<std::vector<uint8_t>, size_t> StreamAsset(const std::string& productId, const std::string& assetType, const std::string& token, const std::string& hwid) {
+        LDIAG() << "[api] StreamAsset: product=" << productId << " type=" << assetType << " hwid_len=" << hwid.size();
         std::cout << OBF_S("[API] Fetching encrypted stream for ") << productId << " (" << assetType << ")...\n";
         s_lastStreamHwidMismatch = false;
+        s_lastStreamStatusCode = 0;
+        s_lastStreamErrorBody.clear();
 
         std::string path = OBF_S("/api/products/") + productId + OBF_S("/assets/stream?type=") + assetType;
         HttpResponse resp = PerformRequest(OBF_S("GET"), path, "", token, hwid);
@@ -380,6 +425,12 @@ namespace Api {
         const size_t MIN_ENCRYPTED_LEN = 29;
 
         if (!resp.success) {
+            s_lastStreamStatusCode = resp.statusCode;
+            s_lastStreamErrorBody = resp.body;
+                LDIAG() << "[api] StreamAsset FAILED: HTTP " << resp.statusCode
+                    << " bodySize=" << resp.body.size()
+                    << " bodyPreview=" << resp.body.substr(0, (std::min)(resp.body.size(), size_t(200)))
+                    << " path=" << path;
             if (resp.statusCode == 403) {
                 s_lastStreamHwidMismatch = true;
                 std::cout << OBF_S("[API] HWID mismatch.\n");
@@ -390,6 +441,11 @@ namespace Api {
         }
 
         if (resp.body.size() < MIN_ENCRYPTED_LEN) {
+            s_lastStreamStatusCode = resp.statusCode;
+            s_lastStreamErrorBody = resp.body;
+                LDIAG() << "[api] StreamAsset FAILED: response too small bodySize=" << resp.body.size()
+                    << " minRequired=" << MIN_ENCRYPTED_LEN
+                    << " bodyPreview=" << resp.body.substr(0, (std::min)(resp.body.size(), size_t(200)));
             std::cout << OBF_S("[API] Stream response too small to be valid encrypted data.\n");
             return { {}, 0 };
         }
@@ -407,6 +463,7 @@ namespace Api {
         SecureZeroMemory(secret.data(), secret.size());
 
         if (aesKey.empty()) {
+            LDIAG() << "[api] StreamAsset FAILED: AES key derivation failed";
             std::cout << OBF_S("[API] Failed to derive AES key.\n");
             return { {}, 0 };
         }
@@ -414,9 +471,12 @@ namespace Api {
         std::vector<uint8_t> plaintext = AesGcmDecrypt(aesKey, iv, ciphertext, cipherLen, tag);
         SecureZeroMemory(aesKey.data(), aesKey.size());
 
-        if (plaintext.empty())
+        if (plaintext.empty()) {
+            LDIAG() << "[api] StreamAsset FAILED: AES-GCM decryption failed (possible HWID mismatch) cipherLen=" << cipherLen;
             return { {}, 0 };
+        }
 
+        LDIAG() << "[api] StreamAsset OK: " << plaintext.size() << " bytes decrypted";
         std::cout << OBF_S("[API] Decrypted ") << plaintext.size() << OBF_S(" bytes successfully.\n");
         return { plaintext, resp.allocationSizeHeader };
     }
@@ -440,16 +500,20 @@ namespace Api {
 
         if (resp.success) {
             res.success = true;
-            res.message = OBF_S("Reset request submitted. An admin will review it shortly.");
-        } else if (resp.statusCode == 409) {
-            res.success = false;
-            res.message = OBF_S("You already have a pending HWID reset request.");
+            // Prefer the server's own message (covers new/updated/idempotent cases).
+            std::string serverMsg = GetJsonValue(resp.body, OBF_S("message"));
+            res.message = serverMsg.empty()
+                ? OBF_S("Reset request submitted. An admin will review it shortly.")
+                : serverMsg;
         } else if (resp.statusCode == 401) {
             res.success = false;
             res.message = OBF_S("Session expired. Please log in again.");
         } else {
             res.success = false;
-            res.message = OBF_S("Failed to submit reset request (Err: ") + std::to_string(resp.statusCode) + ")";
+            std::string serverErr = GetJsonValue(resp.body, OBF_S("error"));
+            res.message = serverErr.empty()
+                ? OBF_S("Failed to submit reset request (Err: ") + std::to_string(resp.statusCode) + ")"
+                : serverErr;
         }
         return res;
     }
@@ -515,6 +579,67 @@ namespace Api {
             r.reason = GetJsonValue(resp.body, OBF_S("reason"));
         }
         return r;
+    }
+
+    DriverBringup::MapperConfig GetMapperConfig(const std::string& productId,
+                                                const std::string& token)
+    {
+        DriverBringup::MapperConfig cfg; // default-initialised safe fallback
+
+        std::string path = OBF_S("/api/products/") + productId + OBF_S("/mapper-config");
+        HttpResponse resp = PerformRequest(OBF_S("GET"), path, "", token);
+
+        if (!resp.success || resp.body.empty()) {
+            std::cout << OBF_S("[API] GetMapperConfig failed (status ") << resp.statusCode
+                      << OBF_S("), using defaults.\n");
+            return cfg;
+        }
+
+        std::string pidStr  = GetJsonValue(resp.body, OBF_S("providerPublicId"));
+        std::string scvStr  = GetJsonValue(resp.body, OBF_S("shellCodeVersion"));
+        std::string dseStr  = GetJsonValue(resp.body, OBF_S("requireDseSuccess"));
+        std::string objName = GetJsonValue(resp.body, OBF_S("driverObjectName"));
+        std::string regPath = GetJsonValue(resp.body, OBF_S("driverRegistryPath"));
+
+        if (!pidStr.empty()) {
+            try { cfg.providerPublicId = std::stoi(pidStr); }
+            catch (...) { std::cout << OBF_S("[API] GetMapperConfig: bad providerPublicId '") << pidStr << "'\n"; }
+        }
+        if (!scvStr.empty()) {
+            try { cfg.shellCodeVersion = std::stoi(scvStr); }
+            catch (...) { std::cout << OBF_S("[API] GetMapperConfig: bad shellCodeVersion '") << scvStr << "'\n"; }
+        }
+        if (!dseStr.empty())  cfg.requireDseSuccess = (dseStr == OBF_S("true"));
+        if (!objName.empty()) cfg.driverObjectName  = objName;
+        if (!regPath.empty()) cfg.driverRegistryPath = regPath;
+
+        return cfg;
+    }
+
+    InjectConfig GetInjectConfig(const std::string& productId,
+                                 const std::string& token)
+    {
+        InjectConfig cfg; // default-initialised safe fallback
+
+        std::string path = OBF_S("/api/products/") + productId + OBF_S("/inject-config");
+        HttpResponse resp = PerformRequest(OBF_S("GET"), path, "", token);
+
+        if (!resp.success || resp.body.empty()) {
+            std::cout << OBF_S("[API] GetInjectConfig failed (status ") << resp.statusCode
+                      << OBF_S("), using defaults.\n");
+            return cfg;
+        }
+
+        std::string nameStr = GetJsonValue(resp.body, OBF_S("targetProcessName"));
+        std::string modeStr = GetJsonValue(resp.body, OBF_S("allocMode"));
+
+        if (!nameStr.empty()) cfg.targetProcessName = nameStr;
+        if (!modeStr.empty()) {
+            try { cfg.allocMode = static_cast<uint32_t>(std::stoul(modeStr)); }
+            catch (...) { std::cout << OBF_S("[API] GetInjectConfig: bad allocMode '") << modeStr << "'\n"; }
+        }
+
+        return cfg;
     }
 
     void ReportLoaderEvent(const std::string& eventType,

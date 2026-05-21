@@ -35,13 +35,39 @@
 // alone.
 //
 
-// ───── IPC protocol (kept in lockstep with Scootware-External/utilities/memory/shared_memory_ipc.h) ─────
+// ───── IPC protocol (kept in lockstep with FINAL-DRV/shared_memory_ipc.h — IPC v2 multi-slot) ─────
+//
+// Layout mirror of IPC_MEMORY + IPC_SLOT (shared_memory_ipc.h):
+//
+//   IPC_MEMORY (0x11010 bytes total):
+//     0x00  magic         uint64   — must be IPC_MAGIC = 0x504D585F49504332
+//     0x08  version       uint32   — must be IPC_VERSION = 2
+//     0x0C  active_slots  uint32   — number of active slots (16)
+//     0x10  slots[0..15]  IPC_SLOT — each 0x1100 bytes
+//
+//   IPC_SLOT (0x1100 bytes):
+//     slot+0x00  slot_state  uint32  — SLOT_STATE_FREE(0) / SLOT_STATE_BUSY(1)
+//     slot+0x04  status      uint32  — STATUS_IPC_*
+//     slot+0x08  command     uint32  — CMD_*   ← driver reads THIS for the command
+//     slot+0x0C  process_id  uint32
+//     slot+0x10  cr3_cached  uint64
+//     slot+0x18  cmd_data    union[0x30]
+//     slot+0x48  reserved[0xB8]
+//     slot+0x100 data_buffer[0x1000]
+//
+// Previous version used HOST_IPC_MAGIC = IPC_v1 (0x...31) and a flat
+// host_ipc_header with command at 0x10 (= slots[0].slot_state) and
+// status at 0x14 (= slots[0].status). The driver scans for IPC_v2 magic
+// and reads command from slots[0].command (0x18), so:
+//   * wrong magic  → driver never finds the probe buffer → always NO_DRIVER
+//   * wrong command offset → even if magic matched, PING written to
+//     slot_state (0x10), not command (0x18) → driver never processes it
 
-#define HOST_IPC_MAGIC          0x504D585F49504331ULL
-#define HOST_IPC_VERSION        1
-#define HOST_IPC_DATA_OFFSET    0x100
-#define HOST_IPC_DATA_SIZE      0x1000
-#define HOST_IPC_TOTAL_SIZE     (HOST_IPC_DATA_OFFSET + HOST_IPC_DATA_SIZE)
+#define HOST_IPC_MAGIC          0x504D585F49504332ULL   // IPC_MAGIC  ('PMX_IPC2')
+#define HOST_IPC_VERSION        2                       // IPC_VERSION
+#define HOST_IPC_MAX_SLOTS      16                      // IPC_MAX_SLOTS
+#define HOST_SLOT_SIZE          0x1100                  // sizeof(IPC_SLOT)
+#define HOST_IPC_TOTAL_SIZE     (0x10 + HOST_IPC_MAX_SLOTS * HOST_SLOT_SIZE)  // 0x11010
 
 #define HOST_CMD_IDLE           0
 #define HOST_CMD_PING           8
@@ -52,95 +78,188 @@
 #define HOST_STATUS_SUCCESS     2
 #define HOST_STATUS_ERROR       3
 
+#define HOST_SLOT_STATE_FREE    0
+#define HOST_SLOT_STATE_BUSY    1
+
+// Mirrors IPC_MEMORY header (0x10 bytes)
 #pragma pack(push, 1)
-struct host_ipc_header {
+struct host_mem_header {
     uint64_t magic;          // 0x00
     uint32_t version;        // 0x08
-    uint32_t process_id;     // 0x0C
-    uint32_t command;        // 0x10
-    uint32_t status;         // 0x14
-    uint64_t cr3_cached;     // 0x18
-    uint64_t reserved[4];    // 0x20
+    uint32_t active_slots;   // 0x0C
+};
+
+// Mirrors the fields of IPC_SLOT we actually touch (slot starts at header+0x10)
+struct host_ipc_slot {
+    uint32_t slot_state;     // slot+0x00
+    uint32_t status;         // slot+0x04
+    uint32_t command;        // slot+0x08  ← driver reads command here
+    uint32_t process_id;     // slot+0x0C
+    uint64_t cr3_cached;     // slot+0x10
+    // remaining bytes up to HOST_SLOT_SIZE are zeroed by memset
+};
+
+// Combined view used by the probe (slots[] trails the header in memory)
+struct host_ipc_memory {
+    host_mem_header header;                     // 0x00 – 0x0F
+    host_ipc_slot   slots[HOST_IPC_MAX_SLOTS];  // 0x10 – (each struct is smaller
+                                                //  than HOST_SLOT_SIZE, but the
+                                                //  full allocation is HOST_IPC_TOTAL_SIZE
+                                                //  so padding between slots is covered
+                                                //  by the initial memset)
 };
 #pragma pack(pop)
 
 // PING budget for the probe. Short on purpose: a driver that's actually
 // loaded answers in well under 100ms (it's just a "set status = SUCCESS"
-// in the dispatch loop), so 2.5s is two orders of magnitude of safety
-// margin. Anything longer adds wall-clock to every cold launch where
-// no driver is present, since we always have to wait the full budget
-// in that case.
-//
-// (The previous design used the cheat-side 8s budget, but that ran
-// AFTER the mapper — at probe time we have no reason to be that
-// patient: either the previous launch's driver is up and answers
-// instantly, or it isn't.)
-constexpr int HOST_PROBE_PING_BUDGET_MS     = 2500;
+// in the dispatch loop), so 5s gives ample margin for any scheduling
+// jitter while still being short enough to not stall a cold launch for
+// too long when no driver is present.
+constexpr int HOST_PROBE_PING_BUDGET_MS     = 5000;
 
 // SHUTDOWN budget. The driver's unload path is short but does have to
 // wait for any in-flight IRPs to drain, so 5s is the conservative
 // upper bound.
 constexpr int HOST_PROBE_SHUTDOWN_BUDGET_MS = 5000;
 
+// ───── Static IPC storage ──────────────────────────────────────────────────
+//
+// CRITICAL: this buffer MUST be a static global embedded within the PE image.
+//
+// The driver's find_ipc_buffer() scans the target process in 4 KiB steps
+// from image_base to image_base+SizeOfImage (the range reported by the PE
+// headers). It is looking for IPC_MAGIC at the first qword of each page.
+//
+// A VirtualAlloc'd buffer lives at an arbitrary heap/free-region address,
+// which is completely outside the image scan range — the driver NEVER sees
+// it. A static global with __declspec(align(4096)) is placed inside the
+// .bss section by the linker, at a page-aligned offset within the image.
+// The scan hits it, reads IPC_MAGIC, verifies IPC_VERSION, and maps it.
+//
+// This is exactly what ipc_speed_test.cpp and IPC-Interface/main.cpp do:
+//   __declspec(align(4096)) static char g_ipc_storage[IPC_TOTAL_SIZE];
+//
+// The full HOST_IPC_TOTAL_SIZE (0x11010 bytes = IPC_MEMORY) is allocated so
+// the driver's IoAllocateMdl(ipc_va, IPC_TOTAL_SIZE) call covers the whole
+// structure without reading past the end of our allocation.
+//
+__declspec(align(4096)) static char g_probe_ipc_storage[HOST_IPC_TOTAL_SIZE];
+
 // ───── Probe implementation ─────
 
 namespace {
 
-bool send_ipc(host_ipc_header* h, void* buf, uint32_t cmd, int timeout_ms) {
-    h->status  = HOST_STATUS_IDLE;
+uint64_t now_ns() {
+    static double qpc_to_ns = 0.0;
+    if (qpc_to_ns == 0.0) {
+        LARGE_INTEGER f;
+        ::QueryPerformanceFrequency(&f);
+        qpc_to_ns = 1e9 / static_cast<double>(f.QuadPart);
+    }
+    LARGE_INTEGER c;
+    ::QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * qpc_to_ns);
+}
 
-    // Flush the command-data window so the kernel's page-walked view
-    // sees zeros before we publish the new command. Same cache-line
-    // dance as the cheat's ipc_probe in driver_orchestrator.cpp.
-    for (size_t off = 0x40; off < 0x200; off += 64) {
-        _mm_clflush(reinterpret_cast<char*>(buf) + off);
+// Send a command on slot 0 and wait for the driver to respond.
+// `mem` is the typed view of the IPC buffer; `raw` is the same pointer
+// as a raw byte pointer for cache-line flushes.
+bool send_ipc(host_ipc_memory* mem, void* raw, uint32_t cmd, int timeout_ms) {
+    host_ipc_slot* s = &mem->slots[0];
+
+    // Reset status and command before flushing so the kernel's page-walked
+    // view sees a clean slate before we arm the new command.
+    s->status  = HOST_STATUS_IDLE;
+    s->command = HOST_CMD_IDLE;
+
+    // Flush the header + slot 0 area (covers magic through cmd_data window).
+    for (size_t off = 0; off < 0x80; off += 64) {
+        _mm_clflush(reinterpret_cast<char*>(raw) + off);
     }
     _mm_sfence();
 
-    h->command = cmd;
-    _mm_clflush(buf);
+    // Arm the command. The driver worker checks:
+    //   if (cmd != CMD_IDLE && st == STATUS_IPC_IDLE) → process
+    // command is at slot+0x08 (= buffer+0x18); status is at slot+0x04.
+    s->command = cmd;
+    _mm_clflush(reinterpret_cast<char*>(raw) + 0x10);  // flush slot 0 header
     _mm_sfence();
 
-    // Wall-clock-bounded poll. Sleep granularity early in startup is
-    // ~15ms (timeBeginPeriod hasn't been called), so a counted-loop of
-    // Sleep(1) iterations would massively over-wait — bound the deadline
-    // by GetTickCount64 instead so the timeout means what it says.
-    const ULONGLONG deadline = ::GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
-    while (::GetTickCount64() < deadline) {
-        if (h->status == HOST_STATUS_SUCCESS || h->status == HOST_STATUS_ERROR) {
-            break;
+    const uint64_t start_ns = now_ns();
+    const uint64_t deadline_ns = start_ns + static_cast<uint64_t>(timeout_ms) * 1000000ull;
+
+    // Phase 1: High-performance tight spin (budgeted up to 3ms for quick processing)
+    const uint64_t phase1_deadline_ns = start_ns + 3000000ull;
+    while (now_ns() < phase1_deadline_ns) {
+        UINT32 st = s->status;
+        if (st == HOST_STATUS_SUCCESS || st == HOST_STATUS_ERROR) {
+            return st == HOST_STATUS_SUCCESS;
+        }
+        _mm_pause();
+    }
+
+    // Phase 2: Cooperative yield using SwitchToThread (budgeted up to 10ms)
+    const uint64_t phase2_deadline_ns = start_ns + 10000000ull;
+    while (now_ns() < phase2_deadline_ns && now_ns() < deadline_ns) {
+        UINT32 st = s->status;
+        if (st == HOST_STATUS_SUCCESS || st == HOST_STATUS_ERROR) {
+            return st == HOST_STATUS_SUCCESS;
+        }
+        ::SwitchToThread();
+    }
+
+    // Phase 3: Sleep(1) for power/scheduler friendliness on longer ops
+    while (now_ns() < deadline_ns) {
+        UINT32 st = s->status;
+        if (st == HOST_STATUS_SUCCESS || st == HOST_STATUS_ERROR) {
+            return st == HOST_STATUS_SUCCESS;
         }
         ::Sleep(1);
     }
-    return h->status == HOST_STATUS_SUCCESS;
+    return false;
 }
 
 int run_driver_probe(bool request_shutdown) {
-    // Page-aligned buffer pinned in physical memory. The kernel driver
-    // uses CR3-based scanning of the target process address space to
-    // find IPC_MAGIC; if Windows pages this buffer out before the
-    // driver gets to it, the magic is gone. VirtualLock is best-effort
-    // (it requires the working set to be large enough) but on a
-    // standard desktop it succeeds and pins the single page we need.
-    void* raw = ::VirtualAlloc(nullptr, HOST_IPC_TOTAL_SIZE,
-                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!raw) {
-        return HOST_PROBE_EXIT_NO_DRIVER;
-    }
-    ::VirtualLock(raw, HOST_IPC_TOTAL_SIZE);
-    memset(raw, 0, HOST_IPC_TOTAL_SIZE);
+    // Use the static page-aligned storage declared above.
+    //
+    // The driver's find_ipc_buffer() scans image_base → image_base+SizeOfImage
+    // in 4 KiB steps. g_probe_ipc_storage is a static .bss global inside this
+    // image, so it is within the scan range. A VirtualAlloc'd buffer at a random
+    // heap address would be completely invisible to the scan.
+    //
+    // Touch every page of the storage with memset before writing the magic.
+    // g_probe_ipc_storage is demand-paged (.bss); until first access the PTEs
+    // are not present and translate_linearBE returns 0. The memset below faults
+    // all pages in so the driver's subsequent physical scan can actually find them.
+    //
+    // No VirtualLock is needed: the driver uses MmProbeAndLockPages (called from
+    // the discovery thread) which pins the pages into physical memory for the
+    // lifetime of the MDL — it will fault the pages back in if they were trimmed
+    // in the brief window between our write and its MDL construction.
+    auto* mem = reinterpret_cast<host_ipc_memory*>(g_probe_ipc_storage);
 
-    auto* h = reinterpret_cast<host_ipc_header*>(raw);
-    h->magic   = HOST_IPC_MAGIC;
-    h->version = HOST_IPC_VERSION;
-    h->command = HOST_CMD_IDLE;
-    h->status  = HOST_STATUS_IDLE;
+    memset(g_probe_ipc_storage, 0, HOST_IPC_TOTAL_SIZE);
 
-    _mm_clflush(raw);
+    // Initialise IPC_MEMORY header (matches IPC_MEMORY in shared_memory_ipc.h)
+    mem->header.magic        = HOST_IPC_MAGIC;
+    mem->header.version      = HOST_IPC_VERSION;
+    mem->header.active_slots = HOST_IPC_MAX_SLOTS;
+
+    // Initialise slot 0 (the probe only uses slot 0)
+    mem->slots[0].slot_state  = HOST_SLOT_STATE_FREE;
+    mem->slots[0].status      = HOST_STATUS_IDLE;
+    mem->slots[0].command     = HOST_CMD_IDLE;
+    mem->slots[0].process_id  = 0;
+    mem->slots[0].cr3_cached  = 0;
+
+    // Full fence + flush so the in-cache writes are visible to the kernel's
+    // physical read path before the PING poll below starts.
+    _mm_sfence();
+    _mm_clflush(g_probe_ipc_storage);
     _mm_sfence();
 
     // PING — does any driver answer at all?
-    bool alive = send_ipc(h, raw, HOST_CMD_PING, HOST_PROBE_PING_BUDGET_MS);
+    bool alive = send_ipc(mem, g_probe_ipc_storage, HOST_CMD_PING, HOST_PROBE_PING_BUDGET_MS);
 
     int exit_code = HOST_PROBE_EXIT_NO_DRIVER;
     if (alive) {
@@ -151,7 +270,7 @@ int run_driver_probe(bool request_shutdown) {
             // acknowledges, escalate the exit code so the loader knows
             // it needs to give the kernel a moment before the new
             // mapper goes in.
-            if (send_ipc(h, raw, HOST_CMD_SHUTDOWN, HOST_PROBE_SHUTDOWN_BUDGET_MS)) {
+            if (send_ipc(mem, g_probe_ipc_storage, HOST_CMD_SHUTDOWN, HOST_PROBE_SHUTDOWN_BUDGET_MS)) {
                 exit_code = HOST_PROBE_EXIT_DRIVER_SHUTDOWN;
             }
             // If SHUTDOWN didn't come back as SUCCESS we leave the
@@ -161,15 +280,12 @@ int run_driver_probe(bool request_shutdown) {
         }
     }
 
-    // Burn the magic so the kernel doesn't latch onto a freed buffer
-    // after we exit (page may sit in the freelist for a tick before
-    // it's actually scrubbed).
-    memset(raw, 0, HOST_IPC_TOTAL_SIZE);
-    _mm_clflush(raw);
+    // Burn the magic before returning so the kernel's discovery thread doesn't
+    // latch onto this buffer after the probe exits (the static page may remain
+    // mapped in the freelist briefly before reuse).
+    memset(g_probe_ipc_storage, 0, HOST_IPC_TOTAL_SIZE);
     _mm_sfence();
 
-    ::VirtualUnlock(raw, HOST_IPC_TOTAL_SIZE);
-    ::VirtualFree(raw, 0, MEM_RELEASE);
     return exit_code;
 }
 

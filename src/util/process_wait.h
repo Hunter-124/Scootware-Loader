@@ -31,6 +31,12 @@ namespace ProcessWait {
     // ToolHelp32 snapshot.
     bool IsRunning(const std::wstring& exeName);
 
+    // Returns the PID of the first matching process, or 0 if none.
+    // Case-insensitive comparison against the ToolHelp32 snapshot. Used by
+    // the kernel-injector path to resolve `CMD_INJECT_DLL`'s target_pid
+    // from the server-supplied process name.
+    unsigned long PidFor(const std::wstring& exeName);
+
     // Blocks until the named process appears, periodically calling
     // tickCallback(seconds_elapsed) so the UI thread can refresh its
     // status text. Returns true once the process is detected, or false

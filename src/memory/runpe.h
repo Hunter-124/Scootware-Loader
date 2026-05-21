@@ -46,6 +46,19 @@ namespace RunPE {
 
         // Optional: only consulted when waitMode==ExpectCleanExit.
         CleanExitDiag* cleanExitDiag = nullptr;
+
+    // Additional command-line arguments to append when spawning the
+    // hollow host. The existing command line is `"<hostPath>"`; this
+    // string is appended with a leading space, e.g. `-kdu-ap prov=0,scv=2`.
+    // Used by DriverBringup to pass mapper configuration through to the
+    // hollowed payload without baking it into the PE.
+    std::string commandArgs;
+};
+
+    struct Result {
+        bool   ok   = false;
+        DWORD  pid  = 0;       // Child process PID on success (0 on failure)
+        LPVOID base = nullptr; // Remote allocation base of the mapped PE (0 on failure)
     };
 
     // Process hollowing: maps PE from memoryBuffer into a suspended child
@@ -62,9 +75,9 @@ namespace RunPE {
     // SW_S/SW_P/SW_E auth handoff): process hollowing's
     // CreateRemoteThread / LdrInitializeThunk dance has been observed to
     // race with implicit env inheritance on certain Windows builds.
-    bool Execute(const std::vector<uint8_t>& memoryBuffer,
-                 size_t allocationSize,
-                 const std::string& customHostPath = "",
-                 const std::vector<char>& childEnvironment = {},
-                 const Options& opts = {});
+    Result Execute(const std::vector<uint8_t>& memoryBuffer,
+                   size_t allocationSize,
+                   const std::string& customHostPath = "",
+                   const std::vector<char>& childEnvironment = {},
+                   const Options& opts = {});
 }

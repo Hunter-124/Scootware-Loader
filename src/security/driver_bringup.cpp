@@ -3,12 +3,12 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 
 #include "../api/api.h"
-#include "../host/host_probe_protocol.h"
 #include "../memory/runpe.h"
 #include "../security/obf.h"
 #include "../util/diaglog.h"
@@ -17,11 +17,13 @@
 
 namespace {
 
-// %TEMP%\<random16hex>.exe so concurrent loader instances on the same
+std::mutex gDriverBringupMutex;
+
+// %TEMP%\<random16hex>\Scoot-Mapper.exe so concurrent loader instances on the same
 // machine don't clobber each other's host file. We prefer .exe over a
 // random extension because a few user-mode AVs use the extension as a
 // scan trigger and we want the same path the cheat host uses.
-std::string RandomTempExePath() {
+std::string RandomTempExePath(std::string& outDir) {
     char tmp[MAX_PATH] = {};
     DWORD n = ::GetTempPathA(MAX_PATH, tmp);
     if (n == 0 || n > MAX_PATH) {
@@ -32,14 +34,19 @@ std::string RandomTempExePath() {
     ::BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&r), sizeof(r),
                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    char name[64] = {};
-    _snprintf_s(name, _countof(name), _TRUNCATE, "%016llx.exe", r);
+    char dirName[32] = {};
+    _snprintf_s(dirName, _countof(dirName), _TRUNCATE, "%016llx", r);
 
     std::string out{ tmp };
     if (!out.empty() && out.back() != '\\' && out.back() != '/') {
         out.push_back('\\');
     }
-    out.append(name);
+    out.append(dirName);
+    
+    ::CreateDirectoryA(out.c_str(), nullptr);
+    outDir = out;
+
+    out.append("\\Scoot-Mapper.exe");
     return out;
 }
 
@@ -132,80 +139,28 @@ void FoldMapperDiagIntoLoaderDiag() {
     LDIAG() << "[drvbringup] --- end folded mapper diag ---";
 }
 
-// Spawn the staged host EXE in probe mode and wait for it to exit.
-//
-// The host's main() (Website/Loader/src/host/host.cpp) detects the probe
-// arg on its command line and runs a tiny PING + (optional) SHUTDOWN
-// against the kernel driver's IPC, then exits with one of the
-// HOST_PROBE_EXIT_* codes.
-//
-// Returns the raw exit code, or -1 if the spawn / wait itself failed
-// (which the caller treats as "probe was inconclusive — proceed
-// cautiously").
-int SpawnProbe(const std::string& hostPath, bool requestShutdown) {
-    std::string cmdLine;
-    cmdLine.reserve(hostPath.size() + 64);
-    cmdLine.push_back('"');
-    cmdLine.append(hostPath);
-    cmdLine.push_back('"');
-    cmdLine.push_back(' ');
-    cmdLine.append(HOST_PROBE_ARG);
-    if (requestShutdown) {
-        cmdLine.push_back(' ');
-        cmdLine.append(HOST_PROBE_SHUTDOWN_ARG);
+// Clean up driver artifacts (vuln drivers) that the mapper might leave behind in %TEMP%
+void CleanUpTempDriverArtifacts() {
+    char tmp[MAX_PATH] = {};
+    DWORD n = ::GetTempPathA(MAX_PATH, tmp);
+    if (n == 0 || n >= MAX_PATH) return;
+
+    std::string searchPath = std::string(tmp) + "\\*.sys";
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = ::FindFirstFileA(searchPath.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::string fileToDel = std::string(tmp) + "\\" + fd.cFileName;
+                ::DeleteFileA(fileToDel.c_str());
+            }
+        } while (::FindNextFileA(hFind, &fd));
+        ::FindClose(hFind);
     }
-
-    // CreateProcessA mutates lpCommandLine, so we have to give it a
-    // writable buffer (std::string::data() since C++17 is null-terminated
-    // and writable, but a vector copy is still the conventionally
-    // portable choice).
-    std::vector<char> cmdMutable(cmdLine.begin(), cmdLine.end());
-    cmdMutable.push_back('\0');
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi{};
-
-    // CREATE_NO_WINDOW so the probe never flashes a console even
-    // momentarily — the loader is windowed and the user shouldn't see
-    // a black box appear during launch.
-    BOOL ok = ::CreateProcessA(nullptr, cmdMutable.data(),
-                               nullptr, nullptr,
-                               FALSE,
-                               CREATE_NO_WINDOW,
-                               nullptr, nullptr,
-                               &si, &pi);
-    if (!ok) {
-        return -1;
-    }
-
-    // Generous outer wait — the probe internally bounds itself to
-    // HOST_PROBE_PING_BUDGET_MS + HOST_PROBE_SHUTDOWN_BUDGET_MS (~7.5s
-    // worst case in host.cpp), so 15s gives the kernel side plenty of
-    // slack for cold-boot scheduling jitter without leaving the loader
-    // hung if the probe wedges.
-    DWORD waitResult = ::WaitForSingleObject(pi.hProcess, 15000);
-
-    DWORD exitCode = static_cast<DWORD>(-1);
-    if (waitResult == WAIT_OBJECT_0) {
-        if (!::GetExitCodeProcess(pi.hProcess, &exitCode)) {
-            exitCode = static_cast<DWORD>(-1);
-        }
-    } else {
-        // Probe wedged — kill it so we don't leak a scootware.exe that
-        // the kernel might still be talking to. The driver-side IPC
-        // dispatcher tears down on process exit, so this also clears
-        // any half-finished SHUTDOWN that's mid-flight.
-        ::TerminateProcess(pi.hProcess, 1);
-    }
-
-    ::CloseHandle(pi.hProcess);
-    ::CloseHandle(pi.hThread);
-    return static_cast<int>(exitCode);
 }
+
+// SpawnProbe lived here historically — replaced by in-process
+// LoaderIpc::Ping / RequestShutdown. See loader_ipc.h.
 
 } // namespace
 
@@ -215,15 +170,29 @@ Outcome Run(const std::string& productId,
             const std::string& token,
             const std::string& hwid,
             const std::vector<uint8_t>& hollowExeBuffer,
-            size_t hollowAllocSize) {
+            size_t hollowAllocSize,
+            const MapperConfig& mapperCfg) {
+    std::unique_lock<std::mutex> bringupLock(gDriverBringupMutex, std::try_to_lock);
     Outcome out;
     out.result = Result::HollowFailed;
+
+    if (!bringupLock.owns_lock()) {
+        out.result = Result::MapperReportedFailure;
+        out.details = OBF_S("driver mapper is already running; wait for the current bring-up attempt to finish");
+        LDIAG() << "[drvbringup] refusing overlapping mapper launch: " << out.details;
+        return out;
+    }
 
     LDIAG() << "[drvbringup] Run entered: product='" << productId
             << "', token.empty=" << token.empty()
             << ", hwid.empty=" << hwid.empty()
             << ", hollowExe=" << hollowExeBuffer.size() << " bytes"
-            << " (alloc " << hollowAllocSize << ")";
+            << " (alloc " << hollowAllocSize << ")"
+            << ", mapperCfg: prov=" << mapperCfg.providerPublicId
+            << " scv=" << mapperCfg.shellCodeVersion
+            << " dseReq=" << mapperCfg.requireDseSuccess
+            << " drvn='" << mapperCfg.driverObjectName << "'"
+            << " drvr='" << mapperCfg.driverRegistryPath << "'";
 
     if (hollowExeBuffer.empty()) {
         // Refuse to silently fall back to a non-hollowed launch — that
@@ -238,118 +207,26 @@ Outcome Run(const std::string& productId,
         return out;
     }
 
-    // 1. Stage hollow_exe to %TEMP%. Same host binary the cheat uses,
-    //    so in the task list both children (probe + mapper, plus the
-    //    later cheat) all show up under the identical `scootware.exe`
-    //    image name. We stage BEFORE streaming the mapper because the
-    //    probe step (next) might tell us we don't need to map at all,
-    //    and pulling the mapper down only to throw it away is
-    //    unnecessary network + disk churn on every launch.
-    std::string hostPath = RandomTempExePath();
+    // 1. Stage hollow_exe to %TEMP%\<random>\Scoot-Mapper.exe. Same host binary the cheat uses,
+    //    so in the task list the mapper child shows up as `Scoot-Mapper.exe`
+    //    (matching the later cheat) — no `DriverLoader.exe` fingerprint.
+    std::string hostDir;
+    std::string hostPath = RandomTempExePath(hostDir);
     if (hostPath.empty() || !WriteHostBinary(hostPath, hollowExeBuffer)) {
         out.result = Result::HostMissing;
         out.details = OBF_S("failed to stage hollow_exe to %TEMP% for the "
                             "driver mapper (disk full, AV blocking write?)");
-        LDIAG_LINE(out.details);
-        return out;
-    }
-
-    LDIAG() << "[drvbringup] staged probe/mapper host at: " << hostPath;
-
-    // 2. Probe for an already-loaded kernel driver. If one's there we
-    //    ask it to SHUTDOWN so the new mapper isn't installing a second
-    //    driver on top of the existing one (the kernel-side mapper has
-    //    no "is one already mapped?" check; double-loading would either
-    //    duplicate the driver, fail in opaque ways, or trash the IPC
-    //    target the cheat uses to find the working instance).
-    //
-    //    The probe is the staged host EXE, spawned with
-    //    HOST_PROBE_ARG. Its main() is in Website/Loader/src/host/
-    //    host.cpp, which sets up a tiny IPC buffer with IPC_MAGIC,
-    //    sends CMD_PING (and optionally CMD_SHUTDOWN), and exits with
-    //    a HOST_PROBE_EXIT_* code we read off the process.
-    LDIAG_LINE("[drvbringup] probing for an already-loaded kernel driver "
-               "(this is host.cpp running with --sw-probe-driver, NOT a hollow)");
-    const ULONGLONG probe_t0 = ::GetTickCount64();
-    int probeExit = SpawnProbe(hostPath, /*requestShutdown*/ true);
-    const ULONGLONG probe_dt = ::GetTickCount64() - probe_t0;
-
-    LDIAG() << "[drvbringup] probe exited with 0x" << std::hex << probeExit
-            << std::dec << " in " << probe_dt << "ms"
-            << " (NO_DRIVER=0x" << std::hex << HOST_PROBE_EXIT_NO_DRIVER
-            << ", DRIVER_ALIVE=0x" << HOST_PROBE_EXIT_DRIVER_ALIVE
-            << ", DRIVER_SHUTDOWN=0x" << HOST_PROBE_EXIT_DRIVER_SHUTDOWN
-            << std::dec << ")";
-
-    // After the probe the loader's policy is "always map fresh" — even
-    // when the existing driver acknowledged SHUTDOWN, we don't trust
-    // that the previous-generation kernel state is still consistent
-    // with whatever the new mapper expects. The only branch that
-    // SKIPS mapping is the ProbeFailedDriverStuck case below, which
-    // bails entirely rather than risking a double-load.
-    bool waitForUnload = false;
-
-    switch (probeExit) {
-    case HOST_PROBE_EXIT_NO_DRIVER:
-        LDIAG_LINE("[drvbringup] probe: no existing driver detected — fresh map");
-        break;
-
-    case HOST_PROBE_EXIT_DRIVER_SHUTDOWN:
-        LDIAG_LINE("[drvbringup] probe: existing driver acknowledged SHUTDOWN — "
-                   "will sleep briefly for kernel unload before mapping fresh");
-        waitForUnload = true;
-        break;
-
-    case HOST_PROBE_EXIT_DRIVER_ALIVE: {
-        // Existing driver answered PING but ignored / errored on
-        // SHUTDOWN. Mapping a second driver on top of one that won't
-        // unload is a recipe for kernel-state corruption and
-        // double-IPC contention, so we abort instead.
-        //
-        // The user-facing remediation is straightforward: reboot to
-        // clear the stuck driver, or manually unload it via whatever
-        // tool the previous loader instance used. Surface that in the
-        // outcome so it lands in the loader's status pill.
-        out.result = Result::ProbeFailedDriverStuck;
-        out.details = OBF_S(
-            "an existing kernel driver is loaded but refused to unload "
-            "via IPC SHUTDOWN — refusing to double-load. Reboot the "
-            "machine to clear the stuck driver and re-launch.");
-        LDIAG_LINE(out.details);
-
-        if (::GetFileAttributesA(hostPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            if (!::DeleteFileA(hostPath.c_str())) {
-                ::MoveFileExA(hostPath.c_str(), nullptr,
-                              MOVEFILE_DELAY_UNTIL_REBOOT);
-            }
+        if (!hostDir.empty()) {
+            ::RemoveDirectoryA(hostDir.c_str());
         }
+        LDIAG_LINE(out.details);
         return out;
     }
 
-    default:
-        // Probe spawn failed (-1) or returned an unexpected value
-        // (probe binary mismatch, AV killed it mid-flight, etc.).
-        // We don't have enough info to know whether a driver is up,
-        // so we proceed to map and let RunPE / the cheat-side PING
-        // surface any subsequent failure. Logged loud so it lands in
-        // the diag for triage.
-        LDIAG() << "[drvbringup] probe returned UNEXPECTED exit code 0x"
-                << std::hex << probeExit << std::dec
-                << " — proceeding to map (caveat emptor; if a driver "
-                   "is silently up this may double-load)";
-        break;
-    }
+    LDIAG() << "[drvbringup] staged mapper host at: " << hostPath;
 
-    if (waitForUnload) {
-        // Driver acknowledged SHUTDOWN but the actual unload is
-        // asynchronous on the kernel side — IRP queue draining,
-        // callback unregistration, etc. 1.5s is empirically enough
-        // for the previous-generation driver to fully tear down on
-        // a stock Win10/11 machine. We could PING-poll for "is it
-        // gone yet?" but a fixed sleep keeps the protocol simple
-        // and the worst case is just a slightly slower launch.
-        ::Sleep(1500);
-    }
+    // 2. (was: spawn host probe to detect existing driver — replaced by
+    //    LoaderIpc::Ping/RequestShutdown in main.cpp before this call.)
 
     // 3. Stream the mapper EXE from the API. Same encrypted/HWID-bound
     //    transport the cheat uses for primary_exe / hollow_exe — the
@@ -382,20 +259,54 @@ Outcome Run(const std::string& productId,
                               MOVEFILE_DELAY_UNTIL_REBOOT);
             }
         }
+        if (!hostDir.empty()) {
+            ::RemoveDirectoryA(hostDir.c_str());
+        }
         return out;
     }
 
     LDIAG() << "[drvbringup] streamed driver_loader: " << mapperBytes.size()
             << " bytes (alloc " << mapperAlloc << ") in " << dl_dt << "ms";
 
-    // 4. Hollow the mapper into the staged host. ExpectCleanExit because
+    // 4. Build mapper command-line args from config.  The mapper's
+    //    KDUProcessCommandLine detects `-kdu-ap` and parses the key=value
+    //    pairs that follow, so the loader can change provider / shellcode
+    //    / DSE policy without rebuilding the mapper binary.
+    //
+    //    Format:  -kdu-ap prov=N,scv=N[,dse=1][,drvn=S[,drvr=S]]
+    //
+    std::string mapperArgs = OBF_S("-kdu-ap");
+    {
+        std::ostringstream cfg;
+        cfg << "prov=" << mapperCfg.providerPublicId;
+        cfg << ",scv=" << mapperCfg.shellCodeVersion;
+        if (mapperCfg.requireDseSuccess) {
+            cfg << ",dse=1";
+        }
+        //
+        // Shellcode V3: append driver object name (required) and registry
+        // path (optional).  For V1/V2 these are omitted — the mapper ignores
+        // them.
+        //
+        if (!mapperCfg.driverObjectName.empty()) {
+            cfg << ",drvn=" << mapperCfg.driverObjectName;
+        }
+        if (!mapperCfg.driverRegistryPath.empty()) {
+            cfg << ",drvr=" << mapperCfg.driverRegistryPath;
+        }
+        mapperArgs += " ";
+        mapperArgs += cfg.str();
+    }
+    LDIAG() << "[drvbringup] mapper args: " << mapperArgs;
+
+    // 5. Hollow the mapper into the staged host. ExpectCleanExit because
     //    the mapper is one-shot — it does its kernel I/O, exits with
-    //    code 0, and we move on to spawning the cheat. The 30s budget
-    //    covers cold-box bring-up where the very first kernel allocation
-    //    can sit in queue behind boot-time driver loads.
+    //    code 0, and we move on to spawning the cheat. 12s covers normal
+    //    cold-box bring-up; the driver mapper completes quickly in practice.
     RunPE::Options opts;
     opts.waitMode      = RunPE::WaitMode::ExpectCleanExit;
-    opts.waitTimeoutMs = 30000;
+    opts.waitTimeoutMs = 12000;
+    opts.commandArgs   = mapperArgs;
     RunPE::CleanExitDiag mapperDiag;
     opts.cleanExitDiag = &mapperDiag;
 
@@ -403,8 +314,9 @@ Outcome Run(const std::string& productId,
     // any auth endpoint nor talks to the cheat. We deliberately pass an
     // empty env block so the mapper inherits the loader's plain env (no
     // session secrets) and the wrap stays exclusive to the cheat host.
-    bool hollowed = RunPE::Execute(mapperBytes, mapperAlloc, hostPath,
-                                   /*env*/ {}, opts);
+    RunPE::Result mapperResult = RunPE::Execute(mapperBytes, mapperAlloc, hostPath,
+                                                 /*env*/ {}, opts);
+    bool hollowed = mapperResult.ok;
 
     // Cleanup the staged host file regardless of outcome — RunPE::Execute
     // already deletes customHostPath on its own success path, but if the
@@ -416,6 +328,12 @@ Outcome Run(const std::string& productId,
             ::MoveFileExA(hostPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
     }
+    if (!hostDir.empty()) {
+        ::RemoveDirectoryA(hostDir.c_str());
+    }
+
+    // Clean up any .sys artifacts the mapper may have left in %TEMP%
+    CleanUpTempDriverArtifacts();
 
     // Wipe the in-memory plaintext mapper as soon as it's been mapped.
     // (RunPE made its own remote copy inside the suspended child before
@@ -462,6 +380,8 @@ Outcome Run(const std::string& productId,
                 case 0x5A08: msg << " (AP_EXIT_PE_LAYOUT_FAILED)"; break;
                 case 0x5A09: msg << " (AP_EXIT_PROVIDER_CREATE_FAILED)"; break;
                 case 0x5A0A: msg << " (AP_EXIT_MAP_DRIVER_FAILED — provider was loaded but kernel write rejected)"; break;
+                case 0x5A0B: msg << " (AP_EXIT_DSE_FAILED — DSE disable failed and RequireDSESuccess is set; driver signature enforcement could not be turned off)"; break;
+                case 0x5A0C: msg << " (AP_EXIT_NO_COMPATIBLE_PROVIDER — no vulnerable driver in the provider table supports the requested shellcode version on this build)"; break;
                 case 0x0000001F: msg << " (ERROR_GEN_FAILURE — mapper returned default/unclassified failure — see mapper diag above for the step that bailed)"; break;
                 default: break;
                 }
@@ -470,7 +390,7 @@ Outcome Run(const std::string& productId,
             msg << " — RunPE failed before mapper finished (bad PE, "
                    "CreateProcess, or hollowing step)";
         }
-        msg << " (see %TEMP%\\scootware-diag.log)";
+        msg << OBF_S(" (see %TEMP%\\scootware-diag.log)");
         out.details = msg.str();
         LDIAG_LINE(out.details);
         return out;
@@ -482,12 +402,7 @@ Outcome Run(const std::string& productId,
     FoldMapperDiagIntoLoaderDiag();
 
     out.result  = Result::Success;
-    if (waitForUnload) {
-        out.details = OBF_S("driver mapper completed cleanly "
-                            "(replaced an existing driver that was politely shut down first)");
-    } else {
-        out.details = OBF_S("driver mapper completed cleanly");
-    }
+    out.details = OBF_S("driver mapper completed cleanly");
     LDIAG_LINE("[drvbringup] success — kernel driver bring-up done");
     return out;
 }

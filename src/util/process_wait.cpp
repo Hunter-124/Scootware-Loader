@@ -36,23 +36,28 @@ std::wstring HostProcessFor(const std::string& productId) {
 
 bool IsRunning(const std::wstring& exeName) {
     if (exeName.empty()) return true; // no gating requested
+    return PidFor(exeName) != 0;
+}
+
+unsigned long PidFor(const std::wstring& exeName) {
+    if (exeName.empty()) return 0;
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
 
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    bool found = false;
+    unsigned long pid = 0;
     if (Process32FirstW(snap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, exeName.c_str()) == 0) {
-                found = true;
+                pid = pe.th32ProcessID;
                 break;
             }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
-    return found;
+    return pid;
 }
 
 bool WaitForProcess(const std::wstring& exeName,
