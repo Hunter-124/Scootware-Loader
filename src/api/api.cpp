@@ -8,6 +8,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <iomanip>
 
@@ -298,27 +300,16 @@ static std::wstring Utf8ToWide(const std::string& s) {
     // Asset encryption helpers
     // -----------------------------------------------------------------------
 
-    // XOR-obfuscated AES-256 asset encryption secret (32 bytes).
-    // The server uses this same secret (set as ASSET_ENCRYPTION_SECRET env var)
-    // to derive the AES-256-GCM key: HMAC-SHA256(secret, hwid).
-    // Plaintext: "Sc00tAES-Pr0tect-K3y-4-Ass3ts-!!"
-    // To rotate: XOR your new 32-byte secret against a new mask, update both arrays,
-    // and set the matching hex value in ASSET_ENCRYPTION_SECRET on the server.
+    // The AES-256 asset encryption secret should be set via the
+    // ASSET_ENCRYPTION_SECRET environment variable as a hex string (64 hex chars = 32 bytes).
     static std::vector<uint8_t> GetAesSecret() {
-        static const uint8_t xored[32] = {
-            0x90,0x19,0xA1,0x7E,0xC9,0x13,0xED,0x64,
-            0xDB,0x4D,0xF1,0xFA,0x22,0x87,0xFC,0x3F,
-            0xF5,0x29,0x24,0xD5,0x72,0xDF,0x0E,0xC5,
-            0x32,0x84,0xAF,0x4A,0xF9,0x98,0x4C,0xE1
-        };
-        static const uint8_t mask[32] = {
-            0xC3,0x7A,0x91,0x4E,0xBD,0x52,0xA8,0x37,
-            0xF6,0x1D,0x83,0xCA,0x56,0xE2,0x9F,0x4B,
-            0xD8,0x62,0x17,0xAC,0x5F,0xEB,0x23,0x84,
-            0x41,0xF7,0x9C,0x3E,0x8A,0xB5,0x6D,0xC0
-        };
+        const char* hex = std::getenv("ASSET_ENCRYPTION_SECRET");
+        if (!hex || std::strlen(hex) != 64) return {};
         std::vector<uint8_t> key(32);
-        for (int i = 0; i < 32; i++) key[i] = xored[i] ^ mask[i];
+        for (int i = 0; i < 32; i++) {
+            std::string byteStr(hex + i * 2, 2);
+            key[i] = static_cast<uint8_t>(std::strtol(byteStr.c_str(), nullptr, 16));
+        }
         return key;
     }
 

@@ -13,13 +13,17 @@ cmake_install.cmake
 Makefile
 
 # IDE files
+.vscode/
 .vs/
+*.user
+*.suo
 *.sln
 *.vcxproj
 *.vcxproj.filters
 *.vcxproj.user
 
-# OS files
+# Reverse engineering artifacts (Binary Ninja project files)
+reverse-attempt*
 *.lnk
 Thumbs.db
 .DS_Store
