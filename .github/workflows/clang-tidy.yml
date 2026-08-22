@@ -27,6 +27,6 @@ jobs:
           clang-tidy --version
           cmake -S . -B build/tidy -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+            "-DCMAKE_CXX_CLANG_TIDY=clang-tidy;--extra-arg=-fexceptions"
       - name: Analyze first-party translation units
         run: cmake --build build/tidy
